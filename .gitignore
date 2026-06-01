@@ -1,0 +1,97 @@
+@
+# ===============================
+# Python / FastAPI / Backend
+# ===============================
+__pycache__/
+*.py[cod]
+*.class
+*.so
+
+# Virtual Environments
+venv/
+env/
+.venv/
+Backend/disenv/
+myenv/
+disenv/
+
+# Environment Variables
+.env
+.env.local
+.env.production
+.env.development
+
+# Database
+*.db
+*.sqlite3
+
+# Data / Uploads
+Backend/Uploads/
+Uploads/
+
+# ===============================
+# Flutter / Mobile / Frontend
+# ===============================
+# Dart/Web
+Frontend360/build/
+Frontend360/.dart_tool/
+Frontend360/.packages
+Frontend360/.pub-cache/
+Frontend360/.pub/
+
+# Android
+Frontend360/android/local.properties
+Frontend360/android/key.properties
+Frontend360/android/*.jks
+Frontend360/android/*.keystore
+Frontend360/android/.gradle/
+Frontend360/android/app/debug/
+Frontend360/android/app/profile/
+Frontend360/android/app/release/
+
+# iOS
+Frontend360/ios/Flutter/.last_build_id
+Frontend360/ios/Flutter/App.framework
+Frontend360/ios/Flutter/Flutter.framework
+Frontend360/ios/Flutter/Flutter.podspec
+Frontend360/ios/Flutter/Generated.xcconfig
+Frontend360/ios/Flutter/app.flx
+Frontend360/ios/Flutter/app.zip
+Frontend360/ios/Flutter/flutter_assets/
+Frontend360/ios/Flutter/flutter_export_environment.sh
+Frontend360/ios/Pods/
+Frontend360/ios/.symlinks/
+
+# macOS / Desktop
+Frontend360/macos/Flutter/ephemeral/
+Frontend360/macos/Flutter/GeneratedPluginRegistrant.swift
+Frontend360/macos/Pods/
+
+# Web
+Frontend360/build/
+
+# ===============================
+# IDE / Editor / System
+# ===============================
+.vscode/*
+!.vscode/tasks.json
+!.vscode/launch.json
+.idea/
+*.iml
+*.ipr
+*.iws
+.DS_Store
+Thumbs.db
+pyrightconfig.json
+
+# Logs
+*.log
+
+# Coverage / Misc
+coverage/
+*.cover
+*.pid
+
+# Node dependencies
+node_modules/
+
