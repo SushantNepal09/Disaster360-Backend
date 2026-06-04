@@ -12,7 +12,7 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:9845@localhost:5432/disaster360_db")
 
 # PostgreSQL lai fastapi sanga connect garne
-engine = create_engine(DATABASE_URL)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 # Data haru insert, read, update ani delete garna
 SessionLocal = sessionmaker(
