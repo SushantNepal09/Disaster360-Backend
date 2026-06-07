@@ -35,8 +35,40 @@ class PostIncidentReportRequest(BaseModel):
 
 
 # ======================
+# Get Rescue Team Profile + Stats
+# ======================
+@router.get("/profile")
+def get_rescue_profile(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_rescue_team)
+):
+    """Returns the rescue team member's profile data + mission statistics."""
+    all_ops = db.query(RescueUpdate).filter(
+        RescueUpdate.rescue_team_id == current_user.id
+    ).all()
+
+    total = len(all_ops)
+    active = len([op for op in all_ops if op.status in ["Acknowledged", "Rescue In Progress"]])
+    completed = len([op for op in all_ops if op.status in ["Controlled", "Closed"]])
+
+    return {
+        "id": str(current_user.id),
+        "full_name": current_user.full_name,
+        "email": current_user.email,
+        "phone": getattr(current_user, "phone", None),
+        "role": current_user.role,
+        "stats": {
+            "total_operations": total,
+            "active_operations": active,
+            "completed_operations": completed,
+        }
+    }
+
+
+# ======================
 # View All Verified Reports (rescue team panel)
 # After admin verifies a report it appears here instantly
+# Returns empty list (not 404) when no reports available
 # ======================
 @router.get("/verified-reports", response_model=List[dict])
 def get_verified_reports(
@@ -44,12 +76,6 @@ def get_verified_reports(
     current_user: User = Depends(get_current_rescue_team)
 ):
     reports = db.query(Incident).filter(Incident.status == "Verified").all()
-
-    if not reports:
-        raise HTTPException(
-            status_code=404,
-            detail="No verified reports available for rescue operations"
-        )
 
     result = []
     for r in reports:
@@ -70,7 +96,10 @@ def get_verified_reports(
             "severity": r.severity,
             "status": r.status,
             "rescue_status": rescue_update.status if rescue_update else "Not Acknowledged",
+            "rescue_update_id": rescue_update.id if rescue_update else None,
             "is_acknowledged": rescue_update.is_acknowledged if rescue_update else False,
+            "post_incident_report": rescue_update.post_incident_report if rescue_update else None,
+            "assigned_teams": [a.team_name for a in r.assignments],
             "created_at": r.created_at,
             "updated_at": r.updated_at
         })
@@ -190,6 +219,7 @@ def update_rescue_status(
 
 # ======================
 # View My Active Rescue Operations
+# Returns empty list (not 404) when no operations found
 # ======================
 @router.get("/my-operations", response_model=List[dict])
 def get_my_operations(
@@ -200,12 +230,6 @@ def get_my_operations(
         RescueUpdate.rescue_team_id == current_user.id
     ).all()
 
-    if not operations:
-        raise HTTPException(
-            status_code=404,
-            detail="No active rescue operations found"
-        )
-
     result = []
     for op in operations:
         report = db.query(Incident).filter(Incident.id == op.incident_id).first()
@@ -215,7 +239,10 @@ def get_my_operations(
             "report_title": report.title if report else None,
             "disaster_type": report.disaster_type if report else None,
             "location": report.location if report else None,
+            "latitude": report.latitude if report else None,
+            "longitude": report.longitude if report else None,
             "severity": report.severity if report else None,
+            "description": report.description if report else None,
             "rescue_status": op.status,
             "is_acknowledged": op.is_acknowledged,
             "acknowledged_at": op.acknowledged_at,
