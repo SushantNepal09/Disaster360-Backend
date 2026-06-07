@@ -57,6 +57,7 @@ def get_rescue_profile(
         "email": current_user.email,
         "phone": getattr(current_user, "phone", None),
         "role": current_user.role,
+        "specialization": getattr(current_user, "specialization", None),
         "stats": {
             "total_operations": total,
             "active_operations": active,

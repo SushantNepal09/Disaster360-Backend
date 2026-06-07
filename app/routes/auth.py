@@ -55,6 +55,7 @@ class RegisterRequest(BaseModel):
     citizenship_number: str | None = None
     citizenship_issue_district: str | None = None
     citizenship_issue_date: str | None = None
+    specialization: str | None = None
 
 class ResendVerificationRequest(BaseModel):
     email: EmailStr
@@ -97,6 +98,7 @@ def register(request: Request, payload: RegisterRequest, db: Session = Depends(g
         citizenship_number=payload.citizenship_number,
         citizenship_issue_district=payload.citizenship_issue_district,
         citizenship_issue_date=payload.citizenship_issue_date,  # Note: backend stores as Date but SQLAlchemy handles ISO 8601 string cast natively for Date columns in Postgres/SQLite
+        specialization=payload.specialization if payload.role.lower() == "rescue" else None,
         is_admin=False,  
         is_rescueteam=False,
         is_verified=False,
@@ -238,12 +240,14 @@ def get_profile(
         "phone": user.phone,
         "citizenship_number": user.citizenship_number,
         "citizenship_issue_date": str(user.citizenship_issue_date) if user.citizenship_issue_date else None,
-        "citizenship_issue_district": user.citizenship_issue_district
+        "citizenship_issue_district": user.citizenship_issue_district,
+        "specialization": user.specialization
     }
 
 class ProfileUpdateRequest(BaseModel):
     full_name: str | None = None
     phone: str | None = None
+    specialization: str | None = None
 
 @router.post("/profile")
 def update_profile(
@@ -261,6 +265,8 @@ def update_profile(
         user.full_name = payload.full_name
     if payload.phone is not None:
         user.phone = payload.phone
+    if payload.specialization is not None:
+        user.specialization = payload.specialization
     
     db.commit()
     db.refresh(user)
