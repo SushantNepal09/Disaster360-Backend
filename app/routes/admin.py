@@ -396,6 +396,7 @@ def get_users(
     users = db.query(User).all()
     return [{"id": str(u.id), "full_name": u.full_name, "email": u.email, "phone": u.phone, 
              "role": u.role, "is_admin": u.is_admin, "is_rescueteam": u.is_rescueteam,
+             "specialization": u.specialization,
              "created_at": u.created_at} for u in users]
 
 

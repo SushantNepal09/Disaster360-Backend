@@ -22,6 +22,7 @@ class User(Base):
     citizenship_number = Column(String, unique=True)
     citizenship_issue_date = Column(String)
     citizenship_issue_district = Column(String)
+    specialization = Column(String, nullable=True) # E.g., Firefighter, Medical, Police, SAR
     role = Column(String, default="citizen")
 
     is_admin = Column(Boolean, nullable=False, default=False, server_default="false")

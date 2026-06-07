@@ -129,6 +129,8 @@ def serialize_incident(inc, current_user_id=None):
         "dislikes": dislikes,
         "user_reaction": user_reaction,
         "submissions": submissions,
+        "assigned_teams": [a.team_name for a in getattr(inc, 'assignments', [])],
+        "rescue_team": ", ".join([a.team_name for a in getattr(inc, 'assignments', [])]) if getattr(inc, 'assignments', None) else "Not Assigned",
         "media_urls": [m.file_path for m in inc.media if m.file_type == "image"] if hasattr(inc, "media") and inc.media else []
     }
 
