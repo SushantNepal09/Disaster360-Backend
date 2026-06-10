@@ -101,6 +101,7 @@ def get_verified_reports(
             "is_acknowledged": rescue_update.is_acknowledged if rescue_update else False,
             "post_incident_report": rescue_update.post_incident_report if rescue_update else None,
             "assigned_teams": [a.team_name for a in r.assignments],
+            "media_urls": [m.file_path for m in r.media] if r.media else [],
             "created_at": r.created_at,
             "updated_at": r.updated_at
         })
@@ -248,6 +249,7 @@ def get_my_operations(
             "is_acknowledged": op.is_acknowledged,
             "acknowledged_at": op.acknowledged_at,
             "post_incident_report": op.post_incident_report,
+            "media_urls": [m.file_path for m in report.media] if report and report.media else [],
             "created_at": op.created_at,
             "updated_at": op.updated_at
         })
