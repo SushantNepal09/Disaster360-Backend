@@ -13,6 +13,9 @@ from ..models.report import Report
 from ..models.user import User
 from .auth import get_current_user, get_optional_current_user
 from ..models.report_embedding import ReportEmbedding
+from ..models.rescue_update import RescueUpdate
+# pyrefly: ignore [missing-import]
+from sqlalchemy.orm import object_session
 from ..models.report_reaction import ReportReaction, ReactionType
 
 # pyrefly: ignore [missing-import]
@@ -109,6 +112,11 @@ def serialize_incident(inc, current_user_id=None):
             if str(r.user_id) == str(current_user_id):
                 user_reaction = r.reaction_type.value
                 break
+                
+    session = object_session(inc)
+    is_accepted = False
+    if session:
+        is_accepted = session.query(RescueUpdate).filter(RescueUpdate.incident_id == inc.id).first() is not None
 
     return {
         "id": inc.id,
@@ -131,6 +139,7 @@ def serialize_incident(inc, current_user_id=None):
         "submissions": submissions,
         "assigned_teams": [a.team_name for a in getattr(inc, 'assignments', [])],
         "rescue_team": ", ".join([a.team_name for a in getattr(inc, 'assignments', [])]) if getattr(inc, 'assignments', None) else "Not Assigned",
+        "is_accepted": is_accepted,
         "media_urls": [m.file_path for m in inc.media if m.file_type == "image"] if hasattr(inc, "media") and inc.media else []
     }
 
