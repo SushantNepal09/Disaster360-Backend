@@ -100,6 +100,7 @@ def get_verified_reports(
             "rescue_update_id": rescue_update.id if rescue_update else None,
             "is_acknowledged": rescue_update.is_acknowledged if rescue_update else False,
             "post_incident_report": rescue_update.post_incident_report if rescue_update else None,
+            "media_urls": [m.file_path for m in r.media if m.file_type == "image"] if hasattr(r, "media") and r.media else [],
             "assigned_teams": [a.team_name for a in r.assignments],
             "created_at": r.created_at,
             "updated_at": r.updated_at
@@ -244,6 +245,7 @@ def get_my_operations(
             "longitude": report.longitude if report else None,
             "severity": report.severity if report else None,
             "description": report.description if report else None,
+            "media_urls": [m.file_path for m in report.media if m.file_type == "image"] if report and hasattr(report, "media") and report.media else [],
             "rescue_status": op.status,
             "is_acknowledged": op.is_acknowledged,
             "acknowledged_at": op.acknowledged_at,
