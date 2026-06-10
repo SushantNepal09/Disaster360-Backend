@@ -76,10 +76,14 @@ def get_verified_reports(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_rescue_team)
 ):
-    reports = db.query(Incident).filter(Incident.status == "Verified").all()
+    reports = db.query(Incident).filter(Incident.status.in_(["Verified", "Assigned"])).all()
 
     result = []
     for r in reports:
+        assigned_teams = [a.team_name for a in getattr(r, 'assignments', [])]
+        if current_user.full_name not in assigned_teams:
+            continue
+
         # Check if this rescue team member has already acknowledged this incident
         rescue_update = db.query(RescueUpdate).filter(
             RescueUpdate.incident_id == r.id,
@@ -123,10 +127,10 @@ def acknowledge_report(
     if not report:
         raise HTTPException(status_code=404, detail="Incident not found")
 
-    if report.status != "Verified": # type: ignore
+    if report.status not in ["Verified", "Assigned"]:
         raise HTTPException(
             status_code=400,
-            detail="Only verified incidents can be acknowledged"
+            detail="Only verified or assigned incidents can be acknowledged"
         )
 
     # Check if already acknowledged by this rescue team member

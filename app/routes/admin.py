@@ -183,6 +183,7 @@ def update_report_status(
     allowed_status = [
         "Pending",
         "Verified",
+        "Assigned",
         "Verified Rescue In Progress",
         "Verified Controlled",
         "Verified and Closed"
@@ -230,12 +231,40 @@ def admin_assign_team(
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
 
+    if incident.status == "Pending":
+        raise HTTPException(status_code=400, detail="Pending reports cannot be assigned to rescue teams")
+
     # Clear existing assignments
     db.query(IncidentAssignment).filter(IncidentAssignment.incident_id == incident.id).delete()
+
+    from ..models.rescue_update import RescueUpdate
+
+    # Drop old RescueUpdate records for teams that are no longer assigned
+    if not payload.team_names:
+        db.query(RescueUpdate).filter(RescueUpdate.incident_id == incident.id).delete()
+    else:
+        assigned_users = db.query(User).filter(User.full_name.in_(payload.team_names)).all()
+        assigned_user_ids = [u.id for u in assigned_users]
+        if assigned_user_ids:
+            db.query(RescueUpdate).filter(
+                RescueUpdate.incident_id == incident.id,
+                ~RescueUpdate.rescue_team_id.in_(assigned_user_ids)
+            ).delete()
+        else:
+            db.query(RescueUpdate).filter(RescueUpdate.incident_id == incident.id).delete()
 
     # Add new ones
     for t in payload.team_names:
         db.add(IncidentAssignment(incident_id=incident.id, team_name=t))
+
+    if payload.team_names:
+        incident.status = "Assigned"
+        for r in incident.reports:
+            r.status = "Assigned"
+    elif incident.status == "Assigned":
+        incident.status = "Verified"
+        for r in incident.reports:
+            r.status = "Verified"
 
     db.commit()
     db.refresh(incident)
