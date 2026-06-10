@@ -12,7 +12,7 @@ from datetime import datetime
 
 from ..database import get_db
 from ..models.incident import Incident
-from ..models.rescue_update import RescueUpdate
+from ..models.rescue_update import RescueUpdate, RescueUpdateStatus
 from ..models.user import User
 from .auth import get_current_rescue_team
 
@@ -80,8 +80,8 @@ def get_verified_reports(
 
     result = []
     for r in reports:
-        assigned_teams = [a.team_name for a in getattr(r, 'assignments', [])]
-        if current_user.full_name not in assigned_teams:
+        assigned_team_ids = [str(a.team_id) for a in getattr(r, 'assignments', []) if a.team_id is not None]
+        if str(current_user.id) not in assigned_team_ids:
             continue
 
         # Check if this rescue team member has already acknowledged this incident
@@ -149,7 +149,7 @@ def acknowledge_report(
     rescue_update = RescueUpdate(
         incident_id=payload.incident_id,
         rescue_team_id=current_user.id,
-        status="Acknowledged",
+        status=RescueUpdateStatus.acknowledged,
         is_acknowledged=True,
         acknowledged_at=datetime.utcnow()
     )

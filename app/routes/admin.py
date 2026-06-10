@@ -23,7 +23,7 @@ router = APIRouter(prefix="/admin", tags=["Admin"])
 # Pydantic Schemas
 # ======================
 class AssignTeamRequest(BaseModel):
-    team_names: List[str]
+    team_ids: list[str] = []
 
 
 class StatusUpdateRequest(BaseModel):
@@ -239,11 +239,13 @@ def admin_assign_team(
 
     from ..models.rescue_update import RescueUpdate
 
+    assigned_users = []
+
     # Drop old RescueUpdate records for teams that are no longer assigned
-    if not payload.team_names:
+    if not payload.team_ids:
         db.query(RescueUpdate).filter(RescueUpdate.incident_id == incident.id).delete()
     else:
-        assigned_users = db.query(User).filter(User.full_name.in_(payload.team_names)).all()
+        assigned_users = db.query(User).filter(User.id.in_(payload.team_ids)).all()
         assigned_user_ids = [u.id for u in assigned_users]
         if assigned_user_ids:
             db.query(RescueUpdate).filter(
@@ -254,10 +256,10 @@ def admin_assign_team(
             db.query(RescueUpdate).filter(RescueUpdate.incident_id == incident.id).delete()
 
     # Add new ones
-    for t in payload.team_names:
-        db.add(IncidentAssignment(incident_id=incident.id, team_name=t))
+    for u in assigned_users:
+        db.add(IncidentAssignment(incident_id=incident.id, team_name=u.full_name or u.email, team_id=u.id))
 
-    if payload.team_names:
+    if payload.team_ids:
         incident.status = "Assigned"
         for r in incident.reports:
             r.status = "Assigned"
@@ -272,7 +274,7 @@ def admin_assign_team(
     return {
         "message": "Teams assigned successfully",
         "report_id": incident.id,
-        "assigned_teams": payload.team_names,
+        "assigned_teams": payload.team_ids,
         "assigned_by": current_user.email
     }
 
