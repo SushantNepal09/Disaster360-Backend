@@ -154,9 +154,13 @@ def acknowledge_report(
         acknowledged_at=datetime.utcnow()
     )
 
+    # Update parent incident status
+    report.status = "Acknowledged"
+    
     db.add(rescue_update)
     db.commit()
     db.refresh(rescue_update)
+    db.refresh(report)
 
     return {
         "message": f"Incident {payload.incident_id} acknowledged successfully",
