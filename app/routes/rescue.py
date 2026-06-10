@@ -12,7 +12,7 @@ from datetime import datetime
 
 from ..database import get_db
 from ..models.incident import Incident
-from ..models.rescue_update import RescueUpdate
+from ..models.rescue_update import RescueUpdate, RescueUpdateStatus
 from ..models.user import User
 from .auth import get_current_rescue_team
 
@@ -76,10 +76,14 @@ def get_verified_reports(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_rescue_team)
 ):
-    reports = db.query(Incident).filter(Incident.status == "Verified").all()
+    reports = db.query(Incident).filter(Incident.status.in_(["Verified", "Assigned"])).all()
 
     result = []
     for r in reports:
+        assigned_team_ids = [str(a.team_id) for a in getattr(r, 'assignments', []) if a.team_id is not None]
+        if str(current_user.id) not in assigned_team_ids:
+            continue
+
         # Check if this rescue team member has already acknowledged this incident
         rescue_update = db.query(RescueUpdate).filter(
             RescueUpdate.incident_id == r.id,
@@ -101,6 +105,7 @@ def get_verified_reports(
             "is_acknowledged": rescue_update.is_acknowledged if rescue_update else False,
             "post_incident_report": rescue_update.post_incident_report if rescue_update else None,
             "assigned_teams": [a.team_name for a in r.assignments],
+            "media_urls": [m.file_path for m in r.media] if r.media else [],
             "created_at": r.created_at,
             "updated_at": r.updated_at
         })
@@ -122,10 +127,10 @@ def acknowledge_report(
     if not report:
         raise HTTPException(status_code=404, detail="Incident not found")
 
-    if report.status != "Verified": # type: ignore
+    if report.status not in ["Verified", "Assigned"]:
         raise HTTPException(
             status_code=400,
-            detail="Only verified incidents can be acknowledged"
+            detail="Only verified or assigned incidents can be acknowledged"
         )
 
     # Check if already acknowledged by this rescue team member
@@ -144,14 +149,18 @@ def acknowledge_report(
     rescue_update = RescueUpdate(
         incident_id=payload.incident_id,
         rescue_team_id=current_user.id,
-        status="Acknowledged",
+        status=RescueUpdateStatus.acknowledged,
         is_acknowledged=True,
         acknowledged_at=datetime.utcnow()
     )
 
+    # Update parent incident status
+    report.status = "Acknowledged"
+    
     db.add(rescue_update)
     db.commit()
     db.refresh(rescue_update)
+    db.refresh(report)
 
     return {
         "message": f"Incident {payload.incident_id} acknowledged successfully",
@@ -248,6 +257,7 @@ def get_my_operations(
             "is_acknowledged": op.is_acknowledged,
             "acknowledged_at": op.acknowledged_at,
             "post_incident_report": op.post_incident_report,
+            "media_urls": [m.file_path for m in report.media] if report and report.media else [],
             "created_at": op.created_at,
             "updated_at": op.updated_at
         })
