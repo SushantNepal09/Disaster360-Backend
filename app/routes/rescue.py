@@ -1,6 +1,6 @@
 
 # pyrefly: ignore [missing-import]
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import Session
@@ -15,6 +15,7 @@ from ..models.incident import Incident
 from ..models.rescue_update import RescueUpdate
 from ..models.user import User
 from .auth import get_current_rescue_team
+from ..services.notification_service import send_push_notification_task, NotificationType
 
 router = APIRouter(prefix="/rescue", tags=["Rescue Team"])
 
@@ -169,6 +170,7 @@ def acknowledge_report(
 def update_rescue_status(
     rescue_update_id: int,
     payload: StatusUpdateRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_rescue_team)
 ):
@@ -209,6 +211,19 @@ def update_rescue_status(
     rescue_update.status = payload.status # type: ignore
     db.commit()
     db.refresh(rescue_update)
+
+    incident = db.query(Incident).filter(Incident.id == rescue_update.incident_id).first()
+    if incident:
+        reporter_ids = list(set([str(r.user_id) for r in incident.reports if r.user_id]))
+        if reporter_ids:
+            background_tasks.add_task(
+                send_push_notification_task,
+                reporter_ids,
+                NotificationType.RESCUE_UPDATE,
+                "Rescue Operation Update",
+                f"Rescue team status updated to: {rescue_update.status}",
+                {"incident_id": str(incident.id)}
+            )
 
     return {
         "message": "Rescue operation status updated successfully",

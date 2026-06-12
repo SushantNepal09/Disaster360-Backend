@@ -18,6 +18,8 @@ class Report(Base):
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))
     
     # User's specific description
+    title = Column(String, nullable=True)
+    severity = Column(String, nullable=True)
     description = Column(Text)
     
     # Store images (you could also use report_media but storing one per report is simple)

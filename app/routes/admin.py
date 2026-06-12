@@ -1,5 +1,5 @@
 # pyrefly: ignore [missing-import]
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import Session
 
@@ -15,6 +15,9 @@ from ..models.report_reaction import ReportReaction
 from ..models.user import User
 from .auth import get_current_admin
 from datetime import datetime, timedelta, timezone
+
+from ..services.geo_service import get_users_to_notify
+from ..services.notification_service import send_push_notification_task, NotificationType
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 
@@ -115,6 +118,7 @@ def admin_update_report(
 @router.put("/reports/{report_id}/verify")
 def verify_report(
     report_id: int,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_admin)
 ):
@@ -135,10 +139,59 @@ def verify_report(
     db.commit()
     db.refresh(incident)
 
+    # Trigger Admin Verification Notification
+    reporter_ids = list(set([str(r.user_id) for r in incident.reports if r.user_id]))
+    DISASTER_RADIUS_KM = {"flood": 5.0, "landslide": 3.0, "earthquake": 50.0, "fire": 2.0, "default": 5.0}
+    radius_km = DISASTER_RADIUS_KM.get(incident.disaster_type.lower() if incident.disaster_type else "default", 5.0)
+    
+    incident_local_unit = None
+    if incident.location:
+        parts = incident.location.split(",")
+        incident_local_unit = parts[-1].strip() if parts else incident.location.strip()
+    
+    nearby_users = get_users_to_notify(db, incident.latitude, incident.longitude, radius_km, incident_local_unit) if incident.latitude and incident.longitude else []
+    nearby_user_ids = [str(u.id) for u in nearby_users]
+    target_users = list(set(reporter_ids + nearby_user_ids))
+    
+    if target_users:
+        background_tasks.add_task(
+            send_push_notification_task,
+            target_users,
+            NotificationType.INCIDENT_VERIFIED,
+            "Incident Verified",
+            f"A {incident.disaster_type} in your area has been confirmed.",
+            {"incident_id": str(incident.id)}
+        )
+
     return {
         "message": f"Incident {report_id} verified successfully",
         "verified_by": current_user.email
     }
+
+
+# ======================
+# Update Child Report Status (approved admin only)
+# ======================
+@router.put("/submissions/{sub_id}/status")
+def update_submission_status(
+    sub_id: int,
+    payload: StatusUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin)
+):
+    valid_statuses = ["Pending", "Verified", "Rejected", "Resolved"]
+    if payload.status not in valid_statuses:
+        raise HTTPException(status_code=400, detail="Invalid status")
+
+    sub = db.query(Report).filter(Report.id == sub_id).first()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Submission not found")
+
+    sub.status = payload.status
+    sub.verified = (payload.status == "Verified")
+    db.commit()
+
+    return {"message": f"Submission status updated to {payload.status}"}
 
 
 # ======================
@@ -177,6 +230,7 @@ def unverify_report(
 def update_report_status(
     report_id: int,
     payload: StatusUpdateRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_admin)
 ):
@@ -207,6 +261,21 @@ def update_report_status(
     db.commit()
     db.refresh(incident)
 
+    if payload.status == "Verified and Closed":
+        DISASTER_RADIUS_KM = {"flood": 5.0, "landslide": 3.0, "earthquake": 50.0, "fire": 2.0, "default": 5.0}
+        radius_km = DISASTER_RADIUS_KM.get(incident.disaster_type.lower() if incident.disaster_type else "default", 5.0)
+        nearby_users = get_users_in_radius(db, incident.latitude, incident.longitude, radius_km) if incident.latitude and incident.longitude else []
+        user_ids = [str(u.id) for u in nearby_users]
+        if user_ids:
+            background_tasks.add_task(
+                send_push_notification_task,
+                user_ids,
+                NotificationType.INCIDENT_CLOSED,
+                "Incident Resolved",
+                "The area is now safe. The disaster has been resolved.",
+                {"incident_id": str(incident.id)}
+            )
+
     return {
         "message": "Incident status updated successfully",
         "report_id": incident.id,
@@ -222,6 +291,7 @@ def update_report_status(
 def admin_assign_team(
     report_id: int,
     payload: AssignTeamRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_admin)
 ):
@@ -239,6 +309,17 @@ def admin_assign_team(
 
     db.commit()
     db.refresh(incident)
+
+    reporter_ids = list(set([str(r.user_id) for r in incident.reports if r.user_id]))
+    if reporter_ids:
+        background_tasks.add_task(
+            send_push_notification_task,
+            reporter_ids,
+            NotificationType.RESCUE_ASSIGNED,
+            "Rescue Team Assigned",
+            "A rescue team has been assigned to your reported incident.",
+            {"incident_id": str(incident.id)}
+        )
 
     return {
         "message": "Teams assigned successfully",
@@ -366,11 +447,14 @@ def get_duplicate_reports(
         reports_info = []
         for r in inc.reports:
             user = db.query(User).filter(User.id == r.user_id).first()
+            child_title = r.title if getattr(r, 'title', None) else f"{inc.disaster_type} — {inc.location if inc.location else 'Unknown'}"
             reports_info.append({
                 "id": f"RPT-{r.id:05d}",
-                "title": f"{inc.disaster_type} — {inc.location if inc.location else 'Unknown'}",
+                "intId": r.id,
+                "title": child_title,
                 "date": r.timestamp.strftime("%b %d, %Y") if getattr(r, "timestamp", None) else inc.created_at.strftime("%b %d, %Y"),
-                "reporter": user.full_name if user else "Unknown"
+                "reporter": user.full_name if user else "Unknown",
+                "status": r.status
             })
         
         summary_ids = " & ".join([f"#{r['id']}" for r in reports_info[:2]])
