@@ -62,6 +62,7 @@ def attach_media(
         # Check duplicate
         existing_media = db.query(ReportMedia).filter(
             ReportMedia.incident_id == report_id,
+            ReportMedia.report_id.is_(None),
             ReportMedia.file_path == url
         ).first()
 
@@ -70,6 +71,7 @@ def attach_media(
         
         media = ReportMedia(
             incident_id=report_id,
+            report_id=None,
             user_id=current_user.id,
             file_path=url,
             file_type=payload.file_type
@@ -81,5 +83,59 @@ def attach_media(
 
     return {
         "message": f"Successfully attached {len(saved_media)} media URLs",
+        "saved_urls": saved_media
+    }
+
+@router.post("/submissions/{sub_id}/media")
+def attach_submission_media(
+    sub_id: int,
+    payload: MediaUrlRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if not payload.media_urls:
+        raise HTTPException(status_code=400, detail="No media URLs provided")
+    if len(payload.media_urls) > 5:
+        raise HTTPException(status_code=400, detail="Maximum 5 images allowed")
+    
+    for url in payload.media_urls:
+        if "supabase.co" not in url:
+            raise HTTPException(status_code=400, detail=f"Invalid media URL: {url}. Only Supabase URLs are allowed.")
+
+    sub = db.query(Report).filter(Report.id == sub_id).first()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Submission not found")
+
+    if sub.user_id != current_user.id and current_user.role != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized to add media for this submission"
+        )
+
+    saved_media = []
+    for url in payload.media_urls:
+        existing_media = db.query(ReportMedia).filter(
+            ReportMedia.incident_id == sub.incident_id,
+            ReportMedia.report_id == sub_id,
+            ReportMedia.file_path == url
+        ).first()
+
+        if existing_media:
+            continue 
+        
+        media = ReportMedia(
+            incident_id=sub.incident_id,
+            report_id=sub_id,
+            user_id=current_user.id,
+            file_path=url,
+            file_type=payload.file_type
+        )
+        db.add(media)
+        saved_media.append(url)
+
+    db.commit()
+
+    return {
+        "message": f"Successfully attached {len(saved_media)} media URLs to submission",
         "saved_urls": saved_media
     }

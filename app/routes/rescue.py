@@ -1,6 +1,6 @@
 
 # pyrefly: ignore [missing-import]
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import Session
@@ -15,6 +15,7 @@ from ..models.incident import Incident
 from ..models.rescue_update import RescueUpdate, RescueUpdateStatus
 from ..models.user import User
 from .auth import get_current_rescue_team
+from ..services.notification_service import send_push_notification_task, NotificationType
 
 router = APIRouter(prefix="/rescue", tags=["Rescue Team"])
 
@@ -104,6 +105,7 @@ def get_verified_reports(
             "rescue_update_id": rescue_update.id if rescue_update else None,
             "is_acknowledged": rescue_update.is_acknowledged if rescue_update else False,
             "post_incident_report": rescue_update.post_incident_report if rescue_update else None,
+            "media_urls": [m.file_path for m in r.media if m.file_type == "image"] if hasattr(r, "media") and r.media else [],
             "assigned_teams": [a.team_name for a in r.assignments],
             "media_urls": [m.file_path for m in r.media] if r.media else [],
             "created_at": r.created_at,
@@ -178,6 +180,7 @@ def acknowledge_report(
 def update_rescue_status(
     rescue_update_id: int,
     payload: StatusUpdateRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_rescue_team)
 ):
@@ -219,6 +222,19 @@ def update_rescue_status(
     db.commit()
     db.refresh(rescue_update)
 
+    incident = db.query(Incident).filter(Incident.id == rescue_update.incident_id).first()
+    if incident:
+        reporter_ids = list(set([str(r.user_id) for r in incident.reports if r.user_id]))
+        if reporter_ids:
+            background_tasks.add_task(
+                send_push_notification_task,
+                reporter_ids,
+                NotificationType.RESCUE_UPDATE,
+                "Rescue Operation Update",
+                f"Rescue team status updated to: {rescue_update.status}",
+                {"incident_id": str(incident.id)}
+            )
+
     return {
         "message": "Rescue operation status updated successfully",
         "rescue_update_id": rescue_update.id,
@@ -253,6 +269,7 @@ def get_my_operations(
             "longitude": report.longitude if report else None,
             "severity": report.severity if report else None,
             "description": report.description if report else None,
+            "media_urls": [m.file_path for m in report.media if m.file_type == "image"] if report and hasattr(report, "media") and report.media else [],
             "rescue_status": op.status,
             "is_acknowledged": op.is_acknowledged,
             "acknowledged_at": op.acknowledged_at,
