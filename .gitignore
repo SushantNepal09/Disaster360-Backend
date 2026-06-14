@@ -95,3 +95,7 @@ coverage/
 # Node dependencies
 node_modules/
 
+# Firebase Service Account
+firebase-adminsdk.json
+*.json
+!package.json
