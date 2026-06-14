@@ -75,3 +75,4 @@ urllib3==2.6.3
 uvicorn==0.41.0
 websockets==16.0
 firebase-admin==6.5.0
+alembic

@@ -13,6 +13,9 @@ from ..models.report import Report
 from ..models.user import User
 from .auth import get_current_user, get_optional_current_user
 from ..models.report_embedding import ReportEmbedding
+from ..models.rescue_update import RescueUpdate
+# pyrefly: ignore [missing-import]
+from sqlalchemy.orm import object_session
 from ..models.report_reaction import ReportReaction, ReactionType
 from ..services.geo_service import get_users_to_notify
 from ..services.notification_service import send_push_notification_task, NotificationType
@@ -130,13 +133,19 @@ def serialize_incident(inc, current_user_id=None):
             "user_reaction": child_user_reaction
         })
 
-    # Parent reactions (only those not attached to any child report)
-    parent_likes = sum(1 for rx in all_reactions if rx.reaction_type.value == "LIKE" and rx.report_id is None)
-    parent_dislikes = sum(1 for rx in all_reactions if rx.reaction_type.value == "DISLIKE" and rx.report_id is None)
-    parent_user_reaction = next((rx.reaction_type.value for rx in all_reactions if rx.report_id is None and str(rx.user_id) == str(current_user_id)), None)
-
-    # Parent media (only those not attached to any child report)
-    parent_media = [m.file_path for m in all_media if m.file_type == "image" and m.report_id is None]
+    likes = sum(1 for r in getattr(inc, 'reactions', []) if r.reaction_type.value == "LIKE")
+    dislikes = sum(1 for r in getattr(inc, 'reactions', []) if r.reaction_type.value == "DISLIKE")
+    user_reaction = None
+    if current_user_id:
+        for r in getattr(inc, 'reactions', []):
+            if str(r.user_id) == str(current_user_id):
+                user_reaction = r.reaction_type.value
+                break
+                
+    session = object_session(inc)
+    is_accepted = False
+    if session:
+        is_accepted = session.query(RescueUpdate).filter(RescueUpdate.incident_id == inc.id).first() is not None
 
     return {
         "id": inc.id,
@@ -159,7 +168,8 @@ def serialize_incident(inc, current_user_id=None):
         "submissions": submissions,
         "assigned_teams": [a.team_name for a in getattr(inc, 'assignments', [])],
         "rescue_team": ", ".join([a.team_name for a in getattr(inc, 'assignments', [])]) if getattr(inc, 'assignments', None) else "Not Assigned",
-        "media_urls": list(set(parent_media))
+        "is_accepted": is_accepted,
+        "media_urls": [m.file_path for m in inc.media if m.file_type == "image"] if hasattr(inc, "media") and inc.media else []
     }
 
 def process_disaster_report(payload: ReportCreateRequest, db: Session, user_id: str | None = None):
