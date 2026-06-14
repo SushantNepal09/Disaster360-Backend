@@ -13,6 +13,7 @@ env/
 .venv/
 Backend/disenv/
 myenv/
+venv/
 disenv/
 
 # Environment Variables
@@ -20,6 +21,11 @@ disenv/
 .env.local
 .env.production
 .env.development
+
+# Credentials / Keys
+firebase-adminsdk.json
+*.pem
+*.key
 
 # Database
 *.db
@@ -95,3 +101,7 @@ coverage/
 # Node dependencies
 node_modules/
 
+# Firebase Service Account
+firebase-adminsdk.json
+*.json
+!package.json

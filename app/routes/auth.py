@@ -274,6 +274,42 @@ def update_profile(
     return {"message": "Profile updated successfully"}
 
 
+class DeviceUpdateRequest(BaseModel):
+    fcm_token: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    local_unit: str | None = None
+
+@router.put("/profile/device")
+def update_device_info(
+    payload: DeviceUpdateRequest,
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db)
+):
+    token_payload = verify_access_token(token)
+    user = db.query(User).filter(User.id == uuid.UUID(token_payload.get("user_id"))).first()
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if payload.fcm_token is not None:
+        user.fcm_token = payload.fcm_token
+    if payload.latitude is not None:
+        user.last_latitude = payload.latitude
+    if payload.longitude is not None:
+        user.last_longitude = payload.longitude
+    if payload.local_unit is not None:
+        user.last_local_unit = payload.local_unit
+        
+    if payload.latitude is not None or payload.longitude is not None or payload.local_unit is not None:
+        user.last_location_update = datetime.now(timezone.utc)
+        
+    db.commit()
+    
+    return {"message": "Device information updated successfully"}
+
+
+
 # ======================
 # Dependency: any logged-in citizen OR approved admin
 # ======================

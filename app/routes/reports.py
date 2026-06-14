@@ -1,10 +1,10 @@
 # pyrefly: ignore [missing-import]
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import Session, joinedload
 # pyrefly: ignore [missing-import]
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Union
 import math
 from datetime import datetime
 from ..database import get_db
@@ -17,6 +17,8 @@ from ..models.rescue_update import RescueUpdate
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import object_session
 from ..models.report_reaction import ReportReaction, ReactionType
+from ..services.geo_service import get_users_to_notify
+from ..services.notification_service import send_push_notification_task, NotificationType
 
 # pyrefly: ignore [missing-import]
 from google.genai import Client
@@ -52,14 +54,14 @@ def get_embedding(text: str) -> list[float]:
             raise ValueError("Google embedding API returned no embeddings")
         return result.embeddings[0].values
     except Exception as e:
-        print("Embedding error:", e)
+        # pass
         return [0.0] * 1536
 
 class ReportCreateRequest(BaseModel):
     disaster_type: str
     title: str
     description: str
-    location: Optional[str] = None
+    location: Optional[Union[List[str], str]] = None
     latitude: float
     longitude: float
     severity: str
@@ -69,7 +71,7 @@ class ReportUpdateRequest(BaseModel):
     disaster_type: Optional[str] = None
     title: Optional[str] = None
     description: Optional[str] = None
-    location: Optional[str] = None      
+    location: Optional[Union[List[str], str]] = None      
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     severity: Optional[str] = None
@@ -88,20 +90,47 @@ def calculate_distance(lat1, lon1, lat2, lon2):
 
 def serialize_incident(inc, current_user_id=None):
     submissions = []
+    
+    # Pre-fetch all media and reactions
+    all_media = getattr(inc, "media", []) or []
+    all_reactions = getattr(inc, "reactions", []) or []
+
     for r in inc.reports:
         user_name = r.user.full_name if (hasattr(r, "user") and r.user) else str(r.user_id)
-        # Using string representation of timestamp for time updated
         ts = r.timestamp.isoformat() if hasattr(r, 'timestamp') and r.timestamp else ''
+        
+        # Child specific fields
+        child_title = r.title if getattr(r, 'title', None) else inc.title
+        child_severity = r.severity if getattr(r, 'severity', None) else inc.severity
+        
+        # Child media: either strictly linked via report_id, or fallback to user_id if legacy (report_id is None)
+        child_media = []
+        for m in all_media:
+            if m.file_type == "image":
+                if m.report_id == r.id:
+                    child_media.append(m.file_path)
+                elif m.report_id is None and str(m.user_id) == str(r.user_id):
+                    child_media.append(m.file_path)
+
+        # Child reactions
+        child_likes = sum(1 for rx in all_reactions if rx.reaction_type.value == "LIKE" and rx.report_id == r.id)
+        child_dislikes = sum(1 for rx in all_reactions if rx.reaction_type.value == "DISLIKE" and rx.report_id == r.id)
+        child_user_reaction = next((rx.reaction_type.value for rx in all_reactions if rx.report_id == r.id and str(rx.user_id) == str(current_user_id)), None)
+
         submissions.append({
             "id": r.id, 
             "user_id": str(r.user_id), 
             "user_name": user_name, 
+            "title": child_title,
             "description": r.description,
+            "severity": child_severity,
             "timestamp": ts,
-            "title": inc.title,
             "status": r.status,
             "verified": getattr(r, 'verified', False),
-            "media_urls": [m.file_path for m in inc.media if str(m.user_id) == str(r.user_id) and m.file_type == "image"] if hasattr(inc, "media") and inc.media else []
+            "media_urls": list(set(child_media)),
+            "likes": child_likes,
+            "dislikes": child_dislikes,
+            "user_reaction": child_user_reaction
         })
 
     likes = sum(1 for r in getattr(inc, 'reactions', []) if r.reaction_type.value == "LIKE")
@@ -133,9 +162,9 @@ def serialize_incident(inc, current_user_id=None):
         "created_at": inc.created_at,
         "updated_at": inc.updated_at,
         "sources": inc.sources or len(submissions),
-        "likes": likes,
-        "dislikes": dislikes,
-        "user_reaction": user_reaction,
+        "likes": parent_likes,
+        "dislikes": parent_dislikes,
+        "user_reaction": parent_user_reaction,
         "submissions": submissions,
         "assigned_teams": [a.team_name for a in getattr(inc, 'assignments', [])],
         "rescue_team": ", ".join([a.team_name for a in getattr(inc, 'assignments', [])]) if getattr(inc, 'assignments', None) else "Not Assigned",
@@ -144,7 +173,12 @@ def serialize_incident(inc, current_user_id=None):
     }
 
 def process_disaster_report(payload: ReportCreateRequest, db: Session, user_id: str | None = None):
-    DISASTER_RADIUS_KM = {"flood": 15.0, "landslide": 5.0, "earthquake": 50.0, "fire": 2.0, "default": 5.0}
+    # Ensure location is a string for the database
+    loc_val = payload.location
+    if isinstance(loc_val, list):
+        loc_val = ", ".join(str(x) for x in loc_val)
+
+    DISASTER_RADIUS_KM = {"flood": 5.0, "landslide": 3.0, "earthquake": 50.0, "fire": 2.0, "default": 5.0}
     TEXT_THRESHOLD = 0.75
 
     RADIUS_KM = DISASTER_RADIUS_KM.get(payload.disaster_type.lower(), DISASTER_RADIUS_KM["default"])
@@ -195,6 +229,8 @@ def process_disaster_report(payload: ReportCreateRequest, db: Session, user_id: 
         new_report = Report(
             incident_id=matched_incident.id, 
             user_id=user_id, 
+            title=payload.title,
+            severity=payload.severity,
             description=payload.description, 
             timestamp=parsed_timestamp,
             status=matched_incident.status,
@@ -210,6 +246,7 @@ def process_disaster_report(payload: ReportCreateRequest, db: Session, user_id: 
             "message": "Your report matched an existing incident and has been merged.",
             "merged": True,
             "report_id": matched_incident.id,
+            "submission_id": new_report.id,
             "disaster_type": payload.disaster_type,
             "similarity_score": round(similarity_score, 4),
             "distance_km": distance_km,
@@ -219,14 +256,21 @@ def process_disaster_report(payload: ReportCreateRequest, db: Session, user_id: 
     else:
         new_incident = Incident(
             disaster_type=payload.disaster_type, title=payload.title, description=payload.description,
-            location=payload.location, latitude=payload.latitude, longitude=payload.longitude,
+            location=loc_val, latitude=payload.latitude, longitude=payload.longitude,
             severity=payload.severity, sources=1, created_at=parsed_timestamp
         )
         db.add(new_incident)
         db.commit()
         db.refresh(new_incident)
 
-        new_report = Report(incident_id=new_incident.id, user_id=user_id, description=payload.description, timestamp=parsed_timestamp)
+        new_report = Report(
+            incident_id=new_incident.id, 
+            user_id=user_id, 
+            title=payload.title,
+            severity=payload.severity,
+            description=payload.description, 
+            timestamp=parsed_timestamp
+        )
         db.add(new_report)
         db.commit()
         db.refresh(new_report)
@@ -236,9 +280,10 @@ def process_disaster_report(payload: ReportCreateRequest, db: Session, user_id: 
         db.commit()
 
         return new_report, {
-            "message": "New report/incident created successfully",
+            "message": "New disaster report created successfully.",
             "merged": False,
             "report_id": new_incident.id,
+            "submission_id": new_report.id,
             "disaster_type": payload.disaster_type,
             "radius_used_km": RADIUS_KM,
             "sources": 1
@@ -247,10 +292,54 @@ def process_disaster_report(payload: ReportCreateRequest, db: Session, user_id: 
 @router.post("/")
 def create_report(
     payload: ReportCreateRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     _, response_data = process_disaster_report(payload, db, current_user.id)
+    
+    incident_id = response_data.get("report_id")
+    
+    # Step 7: Earthquake Broadcast (NATIONAL)
+    if payload.disaster_type.lower() == "earthquake":
+        # Get all users with FCM tokens (except current user)
+        all_users = db.query(User).filter(User.fcm_token.isnot(None), User.id != current_user.id).all()
+        user_ids = [str(u.id) for u in all_users]
+        if user_ids:
+            background_tasks.add_task(
+                send_push_notification_task,
+                user_ids,
+                NotificationType.EARTHQUAKE_ALERT,
+                "EARTHQUAKE ALERT",
+                "Take immediate safety precautions!",
+                {"incident_id": str(incident_id), "type": "earthquake"}
+            )
+            
+    # Step 4: New Incident Created (after deduplication fails)
+    elif not response_data.get("merged"):
+        radius_km = response_data.get("radius_used_km")
+        
+        incident_local_unit = None
+        if payload.location:
+            loc_val = payload.location
+            if isinstance(loc_val, list):
+                loc_val = ", ".join(str(x) for x in loc_val)
+            parts = loc_val.split(",")
+            incident_local_unit = parts[-1].strip() if parts else loc_val.strip()
+            
+        nearby_users = get_users_to_notify(db, payload.latitude, payload.longitude, radius_km, incident_local_unit)
+        user_ids = [str(u.id) for u in nearby_users if str(u.id) != str(current_user.id)]
+        
+        if user_ids:
+            background_tasks.add_task(
+                send_push_notification_task,
+                user_ids,
+                NotificationType.INCIDENT_CREATED,
+                f"New {payload.disaster_type.capitalize()} Reported",
+                f"A new incident has been reported near your location.",
+                {"incident_id": str(incident_id)}
+            )
+            
     return response_data
 
 @router.get("/", response_model=List[dict])
@@ -373,6 +462,7 @@ def react_to_report(
 
     existing_reaction = db.query(ReportReaction).filter(
         ReportReaction.incident_id == report_id,
+        ReportReaction.report_id.is_(None),
         ReportReaction.user_id == current_user.id
     ).first()
 
@@ -386,13 +476,69 @@ def react_to_report(
     else:
         new_reaction = ReportReaction(
             incident_id=report_id,
+            report_id=None,
             user_id=current_user.id,
             reaction_type=ReactionType(reaction)
         )
         db.add(new_reaction)
         db.commit()
 
-    all_reactions = db.query(ReportReaction).filter(ReportReaction.incident_id == report_id).all()
+    all_reactions = db.query(ReportReaction).filter(
+        ReportReaction.incident_id == report_id,
+        ReportReaction.report_id.is_(None)
+    ).all()
+    likes = sum(1 for r in all_reactions if r.reaction_type.value == "LIKE")
+    dislikes = sum(1 for r in all_reactions if r.reaction_type.value == "DISLIKE")
+    
+    user_new_reaction = None
+    for r in all_reactions:
+        if str(r.user_id) == str(current_user.id):
+            user_new_reaction = r.reaction_type.value
+            break
+
+    return {"likes": likes, "dislikes": dislikes, "user_reaction": user_new_reaction}
+
+@router.post("/submissions/{sub_id}/react")
+def react_to_submission(
+    sub_id: int, 
+    reaction: str, 
+    db: Session = Depends(get_db), 
+    current_user: User = Depends(get_current_user)
+):
+    if reaction not in ["LIKE", "DISLIKE"]:
+        raise HTTPException(status_code=400, detail="Invalid reaction type")
+
+    sub = db.query(Report).filter(Report.id == sub_id).first()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Submission not found")
+
+    existing_reaction = db.query(ReportReaction).filter(
+        ReportReaction.incident_id == sub.incident_id,
+        ReportReaction.report_id == sub_id,
+        ReportReaction.user_id == current_user.id
+    ).first()
+
+    if existing_reaction:
+        if existing_reaction.reaction_type.value == reaction:
+            db.delete(existing_reaction)
+            db.commit()
+        else:
+            existing_reaction.reaction_type = ReactionType(reaction)
+            db.commit()
+    else:
+        new_reaction = ReportReaction(
+            incident_id=sub.incident_id,
+            report_id=sub_id,
+            user_id=current_user.id,
+            reaction_type=ReactionType(reaction)
+        )
+        db.add(new_reaction)
+        db.commit()
+
+    all_reactions = db.query(ReportReaction).filter(
+        ReportReaction.incident_id == sub.incident_id,
+        ReportReaction.report_id == sub_id
+    ).all()
     likes = sum(1 for r in all_reactions if r.reaction_type.value == "LIKE")
     dislikes = sum(1 for r in all_reactions if r.reaction_type.value == "DISLIKE")
     

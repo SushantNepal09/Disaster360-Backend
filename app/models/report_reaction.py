@@ -17,6 +17,7 @@ class ReportReaction(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     incident_id = Column(Integer, ForeignKey("incidents.id", ondelete="CASCADE"), nullable=False)
+    report_id = Column(Integer, ForeignKey("reports.id", ondelete="CASCADE"), nullable=True)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     reaction_type = Column(Enum(ReactionType), nullable=False)
 

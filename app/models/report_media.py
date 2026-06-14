@@ -11,6 +11,7 @@ class ReportMedia(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))
     incident_id = Column(Integer, ForeignKey("incidents.id", ondelete="CASCADE"), nullable=True) # Point media to incident
+    report_id = Column(Integer, ForeignKey("reports.id", ondelete="CASCADE"), nullable=True) # Point media to specific report
     file_path = Column(String)
     file_type = Column(String)
 
