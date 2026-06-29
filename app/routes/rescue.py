@@ -249,6 +249,97 @@ def update_rescue_status(
 
 
 # ======================
+
+# ======================
+# Accept a Rescue Assignment
+# ======================
+@router.put("/assignments/{assignment_id}/accept")
+def accept_assignment(
+    assignment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_rescue_team)
+):
+    assignment = db.query(IncidentAssignment).filter(
+        IncidentAssignment.id == assignment_id,
+        IncidentAssignment.team_id == current_user.id
+    ).first()
+
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+
+    if assignment.status != "Assigned":
+        raise HTTPException(status_code=400, detail="Only 'Assigned' assignments can be accepted")
+
+    assignment.status = "Accepted"
+    assignment.accepted_at = datetime.utcnow()
+    
+    # Check if RescueUpdate already exists for this team/incident
+    existing_update = db.query(RescueUpdate).filter(
+        RescueUpdate.incident_id == assignment.incident_id,
+        RescueUpdate.rescue_team_id == current_user.id
+    ).first()
+
+    if not existing_update:
+        rescue_update = RescueUpdate(
+            incident_id=assignment.incident_id,
+            rescue_team_id=current_user.id,
+            status=RescueUpdateStatus.acknowledged,
+            is_acknowledged=True,
+            acknowledged_at=datetime.utcnow()
+        )
+        db.add(rescue_update)
+
+    incident = assignment.incident
+    if incident.status != "Rescue In Progress":
+        incident.status = "Rescue In Progress"
+
+    db.commit()
+    return {"success": True, "message": "Assignment accepted successfully"}
+
+# ======================
+# Reject a Rescue Assignment
+# ======================
+from pydantic import BaseModel
+
+class RejectAssignmentRequest(BaseModel):
+    reason: str = None
+
+@router.put("/assignments/{assignment_id}/reject")
+def reject_assignment(
+    assignment_id: int,
+    payload: RejectAssignmentRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_rescue_team)
+):
+    assignment = db.query(IncidentAssignment).filter(
+        IncidentAssignment.id == assignment_id,
+        IncidentAssignment.team_id == current_user.id
+    ).first()
+
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+
+    if assignment.status != "Assigned":
+        raise HTTPException(status_code=400, detail="Only 'Assigned' assignments can be rejected")
+
+    assignment.status = "Rejected"
+    assignment.rejected_at = datetime.utcnow()
+    assignment.rejection_reason = payload.reason
+    
+    incident = assignment.incident
+    
+    all_assignments = db.query(IncidentAssignment).filter(IncidentAssignment.incident_id == incident.id).all()
+    # Check if all assignments are rejected
+    all_rejected = all(a.status == "Rejected" for a in all_assignments)
+    
+    if all_rejected:
+        incident.status = "Verified"
+        
+    db.commit()
+    return {"success": True, "message": "Assignment rejected successfully"}
+
+
+# ======================
 # View My Assigned Tasks
 # ======================
 @router.get("/my-assignments")
@@ -285,6 +376,8 @@ def get_my_assignments(
 
         data.append({
             "assignmentId": str(a.id),
+            "assignmentStatus": a.status,
+            "rejectionReason": a.rejection_reason,
             "incidentId": str(incident.id),
             "rescueUpdateId": str(rescue_update.id) if rescue_update else None,
             "reporterName": reporter_name,

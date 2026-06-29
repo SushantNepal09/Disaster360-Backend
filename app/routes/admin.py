@@ -304,36 +304,42 @@ def admin_assign_team(
     if incident.status == "Pending":
         raise HTTPException(status_code=400, detail="Pending reports cannot be assigned to rescue teams")
 
-    # Clear existing assignments
-    db.query(IncidentAssignment).filter(IncidentAssignment.incident_id == incident.id).delete()
-
-    from ..models.rescue_update import RescueUpdate
-
+    # Soft Cancel missing active assignments instead of deleting them
+    existing_assignments = db.query(IncidentAssignment).filter(IncidentAssignment.incident_id == incident.id).all()
+    payload_team_ids = [str(t) for t in (payload.team_ids or [])]
+    
+    for a in existing_assignments:
+        # Treat None as active in case of rogue legacy data
+        if str(a.team_id) not in payload_team_ids and (a.status in ["Assigned", "Accepted", "In Progress"] or a.status is None):
+            a.status = "Cancelled"
+            
     assigned_users = []
-
-    # Drop old RescueUpdate records for teams that are no longer assigned
-    if not payload.team_ids:
-        db.query(RescueUpdate).filter(RescueUpdate.incident_id == incident.id).delete()
-    else:
-        assigned_users = db.query(User).filter(User.id.in_(payload.team_ids)).all()
-        assigned_user_ids = [u.id for u in assigned_users]
-        if assigned_user_ids:
-            db.query(RescueUpdate).filter(
-                RescueUpdate.incident_id == incident.id,
-                ~RescueUpdate.rescue_team_id.in_(assigned_user_ids)
-            ).delete()
-        else:
-            db.query(RescueUpdate).filter(RescueUpdate.incident_id == incident.id).delete()
-
-    # Add new ones
-    for u in assigned_users:
-        db.add(IncidentAssignment(incident_id=incident.id, team_name=u.full_name or u.email, team_id=u.id))
-
     if payload.team_ids:
+        assigned_users = db.query(User).filter(User.id.in_(payload.team_ids)).all()
+        
+    for u in assigned_users:
+        # Check if already assigned actively
+        already_active = any(str(a.team_id) == str(u.id) and (a.status in ["Assigned", "Accepted", "In Progress"] or a.status is None) for a in existing_assignments)
+        if not already_active:
+            db.add(IncidentAssignment(
+                incident_id=incident.id, 
+                team_name=u.full_name or u.email, 
+                team_id=u.id,
+                status="Assigned"
+            ))
+
+    # Determine incident status — query directly to avoid stale SQLAlchemy session cache
+    active_count = db.query(IncidentAssignment).filter(
+        IncidentAssignment.incident_id == incident.id,
+        IncidentAssignment.status.in_(["Assigned", "Accepted", "In Progress"])
+    ).count()
+    has_active = active_count > 0
+
+    if payload.team_ids and incident.status == "Verified":
         incident.status = "Assigned"
         for r in incident.reports:
             r.status = "Assigned"
-    elif incident.status == "Assigned":
+    elif not has_active and incident.status in ["Assigned", "Verified"]:
         incident.status = "Verified"
         for r in incident.reports:
             r.status = "Verified"
@@ -709,3 +715,44 @@ def get_analytics(
         "responseTime": response_time
     }
 
+
+# ======================
+# Undo Rescue Assignment
+# ======================
+@router.delete("/assignments/{assignment_id}")
+def undo_rescue_assignment(
+    assignment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin)
+):
+    from ..models.incident_assignment import IncidentAssignment
+    from ..models.incident import Incident
+    
+    assignment = db.query(IncidentAssignment).filter(IncidentAssignment.id == assignment_id).first()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+        
+    incident_id = assignment.incident_id
+    
+    # Soft delete the assignment
+    assignment.status = "Cancelled"
+    db.commit()
+    
+    # Check if any active assignments remain for this incident
+    # Active assignments are those that are NOT Cancelled and NOT Rejected
+    active_assignments = db.query(IncidentAssignment).filter(
+        IncidentAssignment.incident_id == incident_id,
+        IncidentAssignment.status.notin_(["Cancelled", "Rejected"])
+    ).count()
+    
+    # If no active assignments are left, revert the incident status to Verified
+    if active_assignments == 0:
+        incident = db.query(Incident).filter(Incident.id == incident_id).first()
+        if incident and incident.status in ["Assigned", "Verified Rescue In Progress"]:
+            incident.status = "Verified"
+            # Cascade to reports
+            for r in incident.reports:
+                r.status = "Verified"
+            db.commit()
+
+    return {"message": f"Assignment {assignment_id} successfully cancelled"}
