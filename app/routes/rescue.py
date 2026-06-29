@@ -12,6 +12,7 @@ from datetime import datetime
 
 from ..database import get_db
 from ..models.incident import Incident
+from ..models.incident_assignment import IncidentAssignment
 from ..models.rescue_update import RescueUpdate, RescueUpdateStatus
 from ..models.user import User
 from .auth import get_current_rescue_team
@@ -69,50 +70,54 @@ def get_rescue_profile(
 
 # ======================
 # View All Verified Reports (rescue team panel)
-# After admin verifies a report it appears here instantly
-# Returns empty list (not 404) when no reports available
 # ======================
-@router.get("/verified-reports", response_model=List[dict])
-def get_verified_reports(
+@router.get("/all-reports")
+def get_all_reports(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_rescue_team)
 ):
     reports = db.query(Incident).filter(Incident.status.in_(["Verified", "Assigned"])).all()
 
-    result = []
+    data = []
     for r in reports:
-        assigned_team_ids = [str(a.team_id) for a in getattr(r, 'assignments', []) if a.team_id is not None]
-        if str(current_user.id) not in assigned_team_ids:
-            continue
+        reporter_name = "Unknown Reporter"
+        if r.reports and len(r.reports) > 0 and r.reports[0].user:
+            reporter_name = r.reports[0].user.full_name or r.reports[0].user.email or "Unknown Reporter"
 
-        # Check if this rescue team member has already acknowledged this incident
-        rescue_update = db.query(RescueUpdate).filter(
-            RescueUpdate.incident_id == r.id,
-            RescueUpdate.rescue_team_id == current_user.id
-        ).first()
-
-        result.append({
-            "id": r.id,
-            "disaster_type": r.disaster_type,
+        data.append({
+            "incidentId": str(r.id),
+            "reporterName": reporter_name,
+            "reporterStatus": "Active",
             "title": r.title,
+            "disasterType": r.disaster_type,
             "description": r.description,
-            "location": r.location,
-            "latitude": r.latitude,
-            "longitude": r.longitude,
             "severity": r.severity,
             "status": r.status,
-            "rescue_status": rescue_update.status if rescue_update else "Not Acknowledged",
-            "rescue_update_id": rescue_update.id if rescue_update else None,
-            "is_acknowledged": rescue_update.is_acknowledged if rescue_update else False,
-            "post_incident_report": rescue_update.post_incident_report if rescue_update else None,
-            "media_urls": [m.file_path for m in r.media if m.file_type == "image"] if hasattr(r, "media") and r.media else [],
-            "assigned_teams": [a.team_name for a in r.assignments],
-            "media_urls": [m.file_path for m in r.media] if r.media else [],
-            "created_at": r.created_at,
-            "updated_at": r.updated_at
+            "verificationStatus": "Verified",
+            "reportedAt": r.created_at.isoformat() if r.created_at else None,
+            "location": {
+                "address": r.location,
+                "latitude": r.latitude,
+                "longitude": r.longitude
+            },
+            "media": [
+                {
+                    "id": f"MED-{m.id}",
+                    "type": m.file_type,
+                    "url": m.file_path
+                } for m in r.media
+            ] if hasattr(r, "media") and r.media else [],
+            "actions": {
+                "canAssign": False,
+                "canViewDetails": True
+            }
         })
 
-    return result
+    return {
+        "success": True,
+        "message": "All rescue reports fetched successfully",
+        "data": data
+    }
 
 
 # ======================
@@ -244,42 +249,82 @@ def update_rescue_status(
 
 
 # ======================
-# View My Active Rescue Operations
-# Returns empty list (not 404) when no operations found
+# View My Assigned Tasks
 # ======================
-@router.get("/my-operations", response_model=List[dict])
-def get_my_operations(
+@router.get("/my-assignments")
+def get_my_assignments(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_rescue_team)
 ):
-    operations = db.query(RescueUpdate).filter(
-        RescueUpdate.rescue_team_id == current_user.id
+    assignments = db.query(IncidentAssignment).filter(
+        IncidentAssignment.team_id == current_user.id
     ).all()
 
-    result = []
-    for op in operations:
-        report = db.query(Incident).filter(Incident.id == op.incident_id).first()
-        result.append({
-            "rescue_update_id": op.id,
-            "incident_id": op.incident_id,
-            "report_title": report.title if report else None,
-            "disaster_type": report.disaster_type if report else None,
-            "location": report.location if report else None,
-            "latitude": report.latitude if report else None,
-            "longitude": report.longitude if report else None,
-            "severity": report.severity if report else None,
-            "description": report.description if report else None,
-            "media_urls": [m.file_path for m in report.media if m.file_type == "image"] if report and hasattr(report, "media") and report.media else [],
-            "rescue_status": op.status,
-            "is_acknowledged": op.is_acknowledged,
-            "acknowledged_at": op.acknowledged_at,
-            "post_incident_report": op.post_incident_report,
-            "media_urls": [m.file_path for m in report.media] if report and report.media else [],
-            "created_at": op.created_at,
-            "updated_at": op.updated_at
+    data = []
+    for a in assignments:
+        incident = a.incident
+        if not incident:
+            continue
+
+        rescue_update = db.query(RescueUpdate).filter(
+            RescueUpdate.incident_id == incident.id,
+            RescueUpdate.rescue_team_id == current_user.id
+        ).first()
+
+        status = incident.status
+        if rescue_update:
+            status = rescue_update.status
+
+        can_acknowledge = not rescue_update or not rescue_update.is_acknowledged
+        can_update_status = rescue_update is not None and rescue_update.is_acknowledged and rescue_update.status not in ["Controlled", "Closed"]
+        can_submit_report = rescue_update is not None and rescue_update.status in ["Controlled", "Closed"] and not rescue_update.post_incident_report
+
+        reporter_name = "Unknown Reporter"
+        if incident.reports and len(incident.reports) > 0 and incident.reports[0].user:
+            reporter_name = incident.reports[0].user.full_name or incident.reports[0].user.email or "Unknown Reporter"
+
+        data.append({
+            "assignmentId": str(a.id),
+            "incidentId": str(incident.id),
+            "rescueUpdateId": str(rescue_update.id) if rescue_update else None,
+            "reporterName": reporter_name,
+            "reporterStatus": "Active",
+            "title": incident.title,
+            "disasterType": incident.disaster_type,
+            "description": incident.description,
+            "severity": incident.severity,
+            "status": status,
+            "verificationStatus": "Verified",
+            "assignedAt": a.assigned_at.isoformat() if a.assigned_at else None,
+            "reportedAt": incident.created_at.isoformat() if incident.created_at else None,
+            "location": {
+                "address": incident.location,
+                "latitude": incident.latitude,
+                "longitude": incident.longitude
+            },
+            "media": [
+                {
+                    "id": f"MED-{m.id}",
+                    "type": m.file_type,
+                    "url": m.file_path
+                } for m in incident.media
+            ] if hasattr(incident, "media") and incident.media else [],
+            "rescueTeam": {
+                "id": str(current_user.id),
+                "name": current_user.full_name or current_user.email
+            },
+            "actions": {
+                "canAcknowledge": can_acknowledge,
+                "canUpdateStatus": can_update_status,
+                "canSubmitReport": can_submit_report
+            }
         })
 
-    return result
+    return {
+        "success": True,
+        "message": "Assigned tasks fetched successfully",
+        "data": data
+    }
 
 
 # ======================
