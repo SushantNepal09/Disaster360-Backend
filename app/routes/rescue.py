@@ -371,3 +371,63 @@ def submit_post_incident_report(
         "submitted_by": current_user.email,
         "submitted_at": rescue_update.post_incident_submitted_at
     }
+
+
+# ======================
+# View Home Feed (Assigned Reports formatted for shared UI)
+# ======================
+@router.get("/home")
+def get_rescue_home_feed(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_rescue_team)
+):
+    assignments = db.query(IncidentAssignment).filter(
+        IncidentAssignment.team_id == current_user.id
+    ).all()
+
+    data = []
+    for a in assignments:
+        incident = a.incident
+        if not incident:
+            continue
+
+        rescue_update = db.query(RescueUpdate).filter(
+            RescueUpdate.incident_id == incident.id,
+            RescueUpdate.rescue_team_id == current_user.id
+        ).first()
+
+        status = incident.status
+        if rescue_update:
+            status = rescue_update.status
+
+        can_acknowledge = not rescue_update or not rescue_update.is_acknowledged
+
+        reporter_name = "Unknown Reporter"
+        if incident.reports and len(incident.reports) > 0 and incident.reports[0].user:
+            reporter_name = incident.reports[0].user.full_name or incident.reports[0].user.email or "Unknown Reporter"
+
+        data.append({
+            "id": incident.id,
+            "user_id": str(incident.reports[0].user_id) if incident.reports and incident.reports[0].user_id else "",
+            "submissions": [{"user_name": reporter_name}],
+            "disaster_type": incident.disaster_type,
+            "title": incident.title,
+            "description": incident.description,
+            "latitude": incident.latitude,
+            "longitude": incident.longitude,
+            "severity": incident.severity,
+            "status": status,
+            "verified": True,
+            "likes": 0,
+            "dislikes": 0,
+            "user_reaction": None,
+            "created_at": incident.created_at.isoformat() if incident.created_at else "",
+            "media_urls": [m.file_path for m in incident.media] if hasattr(incident, "media") and incident.media else [],
+            "rescue_team": current_user.full_name or current_user.email,
+            "is_accepted": not can_acknowledge
+        })
+
+    # Sort by assigned/created time (newest first)
+    data.sort(key=lambda x: x["created_at"], reverse=True)
+
+    return data
