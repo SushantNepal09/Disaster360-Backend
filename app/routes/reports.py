@@ -166,8 +166,17 @@ def serialize_incident(inc, current_user_id=None):
         "dislikes": dislikes,
         "user_reaction": user_reaction,
         "submissions": submissions,
-        "assigned_teams": [a.team_name for a in getattr(inc, 'assignments', [])],
-        "rescue_team": ", ".join([a.team_name for a in getattr(inc, 'assignments', [])]) if getattr(inc, 'assignments', None) else "Not Assigned",
+        "assigned_teams": [a.team_name for a in getattr(inc, 'assignments', []) if a.status != 'Cancelled'],
+        "assignments": [
+            {
+                "id": str(a.id),
+                "team_id": str(a.team_id),
+                "team_name": a.team_name,
+                "status": a.status if a.status else "Assigned",
+                "rejection_reason": getattr(a, 'rejection_reason', None)
+            } for a in getattr(inc, 'assignments', []) if a.status != 'Cancelled'
+        ],
+        "rescue_team": ", ".join([a.team_name for a in getattr(inc, 'assignments', []) if a.status != 'Cancelled']) or "Not Assigned",
         "is_accepted": is_accepted,
         "media_urls": [m.file_path for m in inc.media if m.file_type == "image"] if hasattr(inc, "media") and inc.media else []
     }
