@@ -145,17 +145,11 @@ class StatusTransitionService:
             new_derived_status = IncidentStatus.VERIFIED
         else:
             # Prioritize states: In Progress > Assigned
-            # If ANY team is in progress
-            if any(a.status == AssignmentStatus.IN_PROGRESS for a in active_assignments):
+            # If ANY team is in progress or accepted
+            if any(a.status in [AssignmentStatus.IN_PROGRESS, AssignmentStatus.ACCEPTED] for a in active_assignments):
                 new_derived_status = IncidentStatus.IN_PROGRESS
-            # Else if ALL teams are completed (Wait, we leave it in IN_PROGRESS, but require admin to confirm it is controlled)
-            # Actually, we could auto-transition to Controlled, but the user requested:
-            # "All teams Completed -> Incident = Awaiting Closure or simply keep Controlled BUT require an admin confirmation"
-            # Since we only have "In Progress" -> "Controlled", we won't auto-transition to "Controlled" unless admin does it manually,
-            # Or we can just leave it as In Progress until Admin checks.
-            # But wait, earlier the user feedback said "Keep Controlled BUT require an admin confirmation". 
-            # I will not auto-transition to Controlled or Closed. The highest auto-state is In Progress.
-            elif any(a.status in [AssignmentStatus.ASSIGNED, AssignmentStatus.ACCEPTED] for a in active_assignments):
+            # Else if ANY team is assigned (and none accepted/in progress)
+            elif any(a.status == AssignmentStatus.ASSIGNED for a in active_assignments):
                 new_derived_status = IncidentStatus.IN_PROGRESS if incident.status == IncidentStatus.IN_PROGRESS else IncidentStatus.ASSIGNED
             else:
                 # All active teams are Completed.

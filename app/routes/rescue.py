@@ -13,6 +13,7 @@ from datetime import datetime
 from app.database import get_db
 from app.models.incident import Incident
 from app.models.incident_assignment import IncidentAssignment
+from app.models.report import Report
 from app.models.rescue_update import RescueUpdate
 from app.models.user import User
 from app.routes.auth import get_current_rescue_team
@@ -47,13 +48,13 @@ def get_rescue_profile(
     current_user: User = Depends(get_current_rescue_team)
 ):
     """Returns the rescue team member's profile data + mission statistics."""
-    all_ops = db.query(RescueUpdate).filter(
-        RescueUpdate.rescue_team_id == current_user.id
+    all_ops = db.query(IncidentAssignment).filter(
+        IncidentAssignment.team_id == current_user.id
     ).all()
 
     total = len(all_ops)
-    active = len([op for op in all_ops if op.status in ["Acknowledged", "Rescue In Progress"]])
-    completed = len([op for op in all_ops if op.status in ["Controlled", "Closed"]])
+    active = len([op for op in all_ops if op.status in [AssignmentStatus.ACCEPTED, AssignmentStatus.IN_PROGRESS, AssignmentStatus.ASSIGNED]])
+    completed = len([op for op in all_ops if op.status == AssignmentStatus.COMPLETED])
 
     return {
         "id": str(current_user.id),
@@ -241,6 +242,7 @@ def update_rescue_status(
 @router.put("/assignments/{assignment_id}/accept")
 def accept_assignment(
     assignment_id: int,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_rescue_team)
 ):
@@ -265,6 +267,35 @@ def accept_assignment(
     ))
 
     db.commit()
+    
+    # Fetch incident for title
+    incident = db.query(Incident).filter(Incident.id == assignment.incident_id).first()
+    incident_title = incident.title if incident else "Disaster Incident"
+    
+    # Notify Admins
+    admins = db.query(User).filter(User.role == "admin").all()
+    admin_ids = [admin.id for admin in admins]
+    if admin_ids:
+        background_tasks.add_task(
+            send_push_notification_task,
+            user_ids=admin_ids,
+            notification_type=NotificationType.SYSTEM,
+            title="Rescue Assignment Accepted",
+            body=f"{current_user.name} has accepted the rescue assignment for \"{incident_title}\"."
+        )
+        
+    # Notify Citizens who reported this incident
+    reports = db.query(Report).filter(Report.incident_id == assignment.incident_id).all()
+    citizen_ids = list(set(r.user_id for r in reports if r.user_id))
+    if citizen_ids:
+        background_tasks.add_task(
+            send_push_notification_task,
+            user_ids=citizen_ids,
+            notification_type=NotificationType.RESCUE_UPDATE,
+            title="Rescue Team En Route",
+            body=f"{current_user.name} has accepted your reported disaster and is now responding."
+        )
+
     return {"success": True, "message": "Assignment accepted successfully"}
 
 # ======================
