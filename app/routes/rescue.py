@@ -348,7 +348,8 @@ def get_my_assignments(
     current_user: User = Depends(get_current_rescue_team)
 ):
     assignments = db.query(IncidentAssignment).filter(
-        IncidentAssignment.team_id == current_user.id
+        IncidentAssignment.team_id == current_user.id,
+        IncidentAssignment.status.notin_(["Cancelled", "Rejected"])
     ).all()
 
     data = []
@@ -475,7 +476,8 @@ def get_rescue_home_feed(
     current_user: User = Depends(get_current_rescue_team)
 ):
     assignments = db.query(IncidentAssignment).filter(
-        IncidentAssignment.team_id == current_user.id
+        IncidentAssignment.team_id == current_user.id,
+        IncidentAssignment.status.notin_(["Cancelled", "Rejected"])
     ).all()
 
     data = []
