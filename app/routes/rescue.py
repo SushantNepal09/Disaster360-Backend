@@ -10,13 +10,15 @@ from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
 
-from ..database import get_db
-from ..models.incident import Incident
-from ..models.incident_assignment import IncidentAssignment
-from ..models.rescue_update import RescueUpdate, RescueUpdateStatus
-from ..models.user import User
-from .auth import get_current_rescue_team
-from ..services.notification_service import send_push_notification_task, NotificationType
+from app.database import get_db
+from app.models.incident import Incident
+from app.models.incident_assignment import IncidentAssignment
+from app.models.rescue_update import RescueUpdate
+from app.models.user import User
+from app.routes.auth import get_current_rescue_team
+from app.services.notification_service import send_push_notification_task, NotificationType
+from app.services.status_transition_service import StatusTransitionService
+from app.core.statuses import IncidentStatus, ReportStatus, AssignmentStatus
 
 router = APIRouter(prefix="/rescue", tags=["Rescue Team"])
 
@@ -29,7 +31,7 @@ class AcknowledgeRequest(BaseModel):
 
 
 class StatusUpdateRequest(BaseModel):
-    status: str  # Acknowledged | Rescue In Progress | Controlled | Closed
+    status: str  # Accepted | In Progress | Completed | Cancelled
 
 
 class PostIncidentReportRequest(BaseModel):
@@ -140,94 +142,77 @@ def acknowledge_report(
             detail="Only verified or assigned incidents can be acknowledged"
         )
 
-    # Check if already acknowledged by this rescue team member
-    existing = db.query(RescueUpdate).filter(
-        RescueUpdate.incident_id == payload.incident_id,
-        RescueUpdate.rescue_team_id == current_user.id
+    # Check if there is an active assignment for this rescue team
+    assignment = db.query(IncidentAssignment).filter(
+        IncidentAssignment.incident_id == payload.incident_id,
+        IncidentAssignment.team_id == current_user.id,
+        IncidentAssignment.status == AssignmentStatus.ASSIGNED
     ).first()
 
-    if existing:
+    if not assignment:
         raise HTTPException(
             status_code=400,
-            detail="You have already acknowledged this incident"
+            detail="You are not assigned to this incident or have already acknowledged it."
         )
 
-    # Create rescue update entry
-    rescue_update = RescueUpdate(
+    # Accept the assignment via transition service
+    StatusTransitionService.change_assignment_status(db, assignment.id, AssignmentStatus.ACCEPTED, current_user.id, "rescue")
+
+    # Add a log entry to RescueUpdate
+    rescue_log = RescueUpdate(
         incident_id=payload.incident_id,
         rescue_team_id=current_user.id,
-        status=RescueUpdateStatus.acknowledged,
-        is_acknowledged=True,
-        acknowledged_at=datetime.utcnow()
+        message="Assignment accepted."
     )
-
-    # Update parent incident status
-    report.status = "Acknowledged"
-    
-    db.add(rescue_update)
+    db.add(rescue_log)
     db.commit()
-    db.refresh(rescue_update)
-    db.refresh(report)
 
     return {
         "message": f"Incident {payload.incident_id} acknowledged successfully",
-        "rescue_update_id": rescue_update.id,
-        "acknowledged_by": current_user.email,
-        "acknowledged_at": rescue_update.acknowledged_at
+        "assignment_id": assignment.id,
+        "acknowledged_by": current_user.email
     }
 
 
 # ======================
 # Update Rescue Operation Status
-# Lifecycle: Acknowledged → Rescue In Progress → Controlled → Closed
+# Lifecycle: Accepted → In Progress → Completed
 # ======================
-@router.put("/operations/{rescue_update_id}/status")
+@router.put("/operations/{assignment_id}/status")
 def update_rescue_status(
-    rescue_update_id: int,
+    assignment_id: int,
     payload: StatusUpdateRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_rescue_team)
 ):
-    allowed_status = [
-        "Acknowledged",
-        "Rescue In Progress",
-        "Controlled",
-        "Closed"
-    ]
-
-    if payload.status not in allowed_status:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid status. Allowed values: {allowed_status}"
-        )
-
-    rescue_update = db.query(RescueUpdate).filter(
-        RescueUpdate.id == rescue_update_id
+    assignment = db.query(IncidentAssignment).filter(
+        IncidentAssignment.id == assignment_id
     ).first()
 
-    if not rescue_update:
-        raise HTTPException(status_code=404, detail="Rescue operation not found")
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Rescue assignment not found")
 
     # Rescue team can only update their own operations
-    if str(rescue_update.rescue_team_id) != str(current_user.id):
+    if str(assignment.team_id) != str(current_user.id):
         raise HTTPException(
             status_code=403,
-            detail="You can only update your own rescue operations"
+            detail="You can only update your own rescue assignments"
         )
 
-    # Must be acknowledged before moving to other statuses
-    if not rescue_update.is_acknowledged:
-        raise HTTPException(
-            status_code=400,
-            detail="Report must be acknowledged before updating status"
-        )
+    # Use the transition service
+    StatusTransitionService.change_assignment_status(db, assignment.id, payload.status, current_user.id, "rescue")
+    
+    # Add an append-only log entry
+    db.add(RescueUpdate(
+        incident_id=assignment.incident_id,
+        rescue_team_id=current_user.id,
+        message=f"Status updated to {payload.status}."
+    ))
 
-    rescue_update.status = payload.status # type: ignore
     db.commit()
-    db.refresh(rescue_update)
 
-    incident = db.query(Incident).filter(Incident.id == rescue_update.incident_id).first()
+    incident = db.query(Incident).filter(Incident.id == assignment.incident_id).first()
     if incident:
         reporter_ids = list(set([str(r.user_id) for r in incident.reports if r.user_id]))
         if reporter_ids:
@@ -236,14 +221,14 @@ def update_rescue_status(
                 reporter_ids,
                 NotificationType.RESCUE_UPDATE,
                 "Rescue Operation Update",
-                f"Rescue team status updated to: {rescue_update.status}",
+                f"Rescue team status updated to: {payload.status}",
                 {"incident_id": str(incident.id)}
             )
 
     return {
-        "message": "Rescue operation status updated successfully",
-        "rescue_update_id": rescue_update.id,
-        "new_status": rescue_update.status,
+        "message": "Rescue assignment status updated successfully",
+        "assignment_id": assignment.id,
+        "new_status": payload.status,
         "updated_by": current_user.email
     }
 
@@ -267,31 +252,17 @@ def accept_assignment(
     if not assignment:
         raise HTTPException(status_code=404, detail="Assignment not found")
 
-    if assignment.status != "Assigned":
+    if assignment.status != AssignmentStatus.ASSIGNED:
         raise HTTPException(status_code=400, detail="Only 'Assigned' assignments can be accepted")
 
-    assignment.status = "Accepted"
-    assignment.accepted_at = datetime.utcnow()
+    StatusTransitionService.change_assignment_status(db, assignment.id, AssignmentStatus.ACCEPTED, current_user.id, "rescue", remarks="Accepted by rescue team")
     
-    # Check if RescueUpdate already exists for this team/incident
-    existing_update = db.query(RescueUpdate).filter(
-        RescueUpdate.incident_id == assignment.incident_id,
-        RescueUpdate.rescue_team_id == current_user.id
-    ).first()
-
-    if not existing_update:
-        rescue_update = RescueUpdate(
-            incident_id=assignment.incident_id,
-            rescue_team_id=current_user.id,
-            status=RescueUpdateStatus.acknowledged,
-            is_acknowledged=True,
-            acknowledged_at=datetime.utcnow()
-        )
-        db.add(rescue_update)
-
-    incident = assignment.incident
-    if incident.status != "Rescue In Progress":
-        incident.status = "Rescue In Progress"
+    # Add a log entry to RescueUpdate
+    db.add(RescueUpdate(
+        incident_id=assignment.incident_id,
+        rescue_team_id=current_user.id,
+        message="Assignment accepted."
+    ))
 
     db.commit()
     return {"success": True, "message": "Assignment accepted successfully"}
@@ -299,6 +270,7 @@ def accept_assignment(
 # ======================
 # Reject a Rescue Assignment
 # ======================
+# pyrefly: ignore [missing-import]
 from pydantic import BaseModel
 
 class RejectAssignmentRequest(BaseModel):
@@ -319,22 +291,19 @@ def reject_assignment(
     if not assignment:
         raise HTTPException(status_code=404, detail="Assignment not found")
 
-    if assignment.status != "Assigned":
+    if assignment.status != AssignmentStatus.ASSIGNED:
         raise HTTPException(status_code=400, detail="Only 'Assigned' assignments can be rejected")
 
-    assignment.status = "Rejected"
-    assignment.rejected_at = datetime.utcnow()
+    StatusTransitionService.change_assignment_status(db, assignment.id, AssignmentStatus.REJECTED, current_user.id, "rescue", remarks=payload.reason)
     assignment.rejection_reason = payload.reason
     
-    incident = assignment.incident
-    
-    all_assignments = db.query(IncidentAssignment).filter(IncidentAssignment.incident_id == incident.id).all()
-    # Check if all assignments are rejected
-    all_rejected = all(a.status == "Rejected" for a in all_assignments)
-    
-    if all_rejected:
-        incident.status = "Verified"
-        
+    # Add a log entry to RescueUpdate
+    db.add(RescueUpdate(
+        incident_id=assignment.incident_id,
+        rescue_team_id=current_user.id,
+        message=f"Assignment rejected: {payload.reason or 'No reason provided'}"
+    ))
+
     db.commit()
     return {"success": True, "message": "Assignment rejected successfully"}
 
@@ -363,13 +332,9 @@ def get_my_assignments(
             RescueUpdate.rescue_team_id == current_user.id
         ).first()
 
-        status = incident.status
-        if rescue_update:
-            status = rescue_update.status
-
-        can_acknowledge = not rescue_update or not rescue_update.is_acknowledged
-        can_update_status = rescue_update is not None and rescue_update.is_acknowledged and rescue_update.status not in ["Controlled", "Closed"]
-        can_submit_report = rescue_update is not None and rescue_update.status in ["Controlled", "Closed"] and not rescue_update.post_incident_report
+        can_acknowledge = a.status == AssignmentStatus.ASSIGNED
+        can_update_status = a.status in [AssignmentStatus.ACCEPTED, AssignmentStatus.IN_PROGRESS]
+        can_submit_report = a.status == AssignmentStatus.COMPLETED and (not rescue_update or not rescue_update.post_incident_report)
 
         reporter_name = "Unknown Reporter"
         if incident.reports and len(incident.reports) > 0 and incident.reports[0].user:
@@ -380,14 +345,14 @@ def get_my_assignments(
             "assignmentStatus": a.status,
             "rejectionReason": a.rejection_reason,
             "incidentId": str(incident.id),
-            "rescueUpdateId": str(rescue_update.id) if rescue_update else None,
+            "assignmentId": str(a.id),
             "reporterName": reporter_name,
             "reporterStatus": "Active",
             "title": incident.title,
             "disasterType": incident.disaster_type,
             "description": incident.description,
             "severity": incident.severity,
-            "status": status,
+            "status": a.status,
             "verificationStatus": "Verified",
             "assignedAt": a.assigned_at.isoformat() if a.assigned_at else None,
             "reportedAt": incident.created_at.isoformat() if incident.created_at else None,
@@ -408,9 +373,9 @@ def get_my_assignments(
                 "name": current_user.full_name or current_user.email
             },
             "actions": {
-                "canAcknowledge": can_acknowledge,
-                "canUpdateStatus": can_update_status,
-                "canSubmitReport": can_submit_report
+                "canAcknowledge": a.status == AssignmentStatus.ASSIGNED,
+                "canUpdateStatus": a.status in [AssignmentStatus.ACCEPTED, AssignmentStatus.IN_PROGRESS],
+                "canSubmitReport": a.status == AssignmentStatus.COMPLETED
             }
         })
 
@@ -423,47 +388,50 @@ def get_my_assignments(
 
 # ======================
 # Submit Post-Incident Report
-# Only allowed when operation status is Controlled or Closed
+# Only allowed when operation status is Completed
 # ======================
-@router.post("/operations/{rescue_update_id}/post-incident-report")
+@router.post("/operations/{assignment_id}/post-incident-report")
 def submit_post_incident_report(
-    rescue_update_id: int,
+    assignment_id: int,
     payload: PostIncidentReportRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_rescue_team)
 ):
-    rescue_update = db.query(RescueUpdate).filter(
-        RescueUpdate.id == rescue_update_id
+    assignment = db.query(IncidentAssignment).filter(
+        IncidentAssignment.id == assignment_id
     ).first()
 
-    if not rescue_update:
-        raise HTTPException(status_code=404, detail="Rescue operation not found")
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Rescue assignment not found")
 
     # Only the assigned rescue team member can submit
-    if str(rescue_update.rescue_team_id) != str(current_user.id):
+    if str(assignment.team_id) != str(current_user.id):
         raise HTTPException(
             status_code=403,
             detail="You can only submit reports for your own operations"
         )
 
-    # Post-incident report only allowed after operation is Controlled or Closed
-    if rescue_update.status not in ["Controlled", "Closed"]:
+    # Post-incident report only allowed after operation is Completed
+    if assignment.status != AssignmentStatus.COMPLETED:
         raise HTTPException(
             status_code=400,
-            detail="Post-incident report can only be submitted when status is 'Controlled' or 'Closed'"
+            detail="Post-incident report can only be submitted when status is 'Completed'"
         )
 
-    rescue_update.post_incident_report = payload.post_incident_report
-    rescue_update.post_incident_submitted_at = datetime.utcnow()
-
+    report_log = RescueUpdate(
+        incident_id=assignment.incident_id,
+        rescue_team_id=current_user.id,
+        post_incident_report=payload.post_incident_report,
+        message="Post-incident report submitted."
+    )
+    db.add(report_log)
     db.commit()
-    db.refresh(rescue_update)
+    db.refresh(report_log)
 
     return {
         "message": "Post-incident report submitted successfully",
-        "rescue_update_id": rescue_update.id,
-        "submitted_by": current_user.email,
-        "submitted_at": rescue_update.post_incident_submitted_at
+        "rescue_update_id": report_log.id,
+        "submitted_by": current_user.email
     }
 
 
@@ -486,16 +454,7 @@ def get_rescue_home_feed(
         if not incident:
             continue
 
-        rescue_update = db.query(RescueUpdate).filter(
-            RescueUpdate.incident_id == incident.id,
-            RescueUpdate.rescue_team_id == current_user.id
-        ).first()
-
-        status = incident.status
-        if rescue_update:
-            status = rescue_update.status
-
-        can_acknowledge = not rescue_update or not rescue_update.is_acknowledged
+        can_acknowledge = a.status == AssignmentStatus.ASSIGNED
 
         reporter_name = "Unknown Reporter"
         if incident.reports and len(incident.reports) > 0 and incident.reports[0].user:
@@ -503,6 +462,7 @@ def get_rescue_home_feed(
 
         data.append({
             "id": incident.id,
+            "assignment_id": a.id,
             "user_id": str(incident.reports[0].user_id) if incident.reports and incident.reports[0].user_id else "",
             "submissions": [{"user_name": reporter_name}],
             "disaster_type": incident.disaster_type,
@@ -511,7 +471,7 @@ def get_rescue_home_feed(
             "latitude": incident.latitude,
             "longitude": incident.longitude,
             "severity": incident.severity,
-            "status": status,
+            "status": a.status,
             "verified": True,
             "likes": 0,
             "dislikes": 0,

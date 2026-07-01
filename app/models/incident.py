@@ -1,7 +1,9 @@
 
 # pyrefly: ignore [missing-import]
+# pyrefly: ignore [missing-import]
 from sqlalchemy import Column, Integer, String, Text, Float, DateTime, Boolean
 from datetime import datetime, timezone
+from app.core.statuses import IncidentStatus
 
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import relationship
@@ -18,7 +20,7 @@ class Incident(Base):
     latitude = Column(Float)
     longitude = Column(Float)
     severity = Column(String)
-    status = Column(String, default="Pending")
+    status = Column(String, default=IncidentStatus.PENDING)
     verified = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.now(timezone.utc))
