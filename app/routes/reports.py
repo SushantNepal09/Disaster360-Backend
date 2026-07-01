@@ -88,7 +88,7 @@ def calculate_distance(lat1, lon1, lat2, lon2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
-def serialize_incident(inc, current_user_id=None):
+def serialize_incident(inc, current_user_id=None, is_admin=False):
     submissions = []
     
     # Pre-fetch all media and reactions
@@ -173,7 +173,11 @@ def serialize_incident(inc, current_user_id=None):
                 "team_id": str(a.team_id),
                 "team_name": a.team_name,
                 "status": a.status if a.status else "Assigned",
-                "rejection_reason": getattr(a, 'rejection_reason', None)
+                "accepted_at": getattr(a, 'accepted_at', None).isoformat() if getattr(a, 'accepted_at', None) else None,
+                "rejection_reason": getattr(a, 'rejection_reason', None) if is_admin else None,
+                "rejected_at": getattr(a, 'rejected_at', None).isoformat() if is_admin and getattr(a, 'rejected_at', None) else None,
+                "completed_at": getattr(a, 'completed_at', None).isoformat() if getattr(a, 'completed_at', None) else None,
+                "last_updated": getattr(a, 'updated_at', None).isoformat() if getattr(a, 'updated_at', None) else None,
             } for a in getattr(inc, 'assignments', []) if a.status != 'Cancelled'
         ],
         "rescue_team": ", ".join([a.team_name for a in getattr(inc, 'assignments', []) if a.status != 'Cancelled']) or "Not Assigned",
@@ -365,7 +369,8 @@ def get_reports(db: Session = Depends(get_db), current_user: User | None = Depen
         .all()
     )
     user_id = current_user.id if current_user else None
-    return [serialize_incident(inc, user_id) for inc in incidents if inc.reports]
+    is_admin_flag = current_user is not None and current_user.role == "admin"
+    return [serialize_incident(inc, user_id, is_admin=is_admin_flag) for inc in incidents if inc.reports]
 
 @router.get("/verified", response_model=List[dict])
 def get_verified_reports(db: Session = Depends(get_db), current_user: User | None = Depends(get_optional_current_user)):
@@ -424,7 +429,8 @@ def get_report(report_id: int, db: Session = Depends(get_db), current_user: User
     inc = db.query(Incident).filter(Incident.id == report_id).options(joinedload(Incident.reports).joinedload(Report.user), joinedload(Incident.reactions)).first()
     if not inc: raise HTTPException(status_code=404, detail="Incident not found")
     user_id = current_user.id if current_user else None
-    return serialize_incident(inc, user_id)
+    is_admin_flag = current_user is not None and current_user.role == "admin"
+    return serialize_incident(inc, user_id, is_admin=is_admin_flag)
 
 @router.put("/{report_id}")
 def update_report(

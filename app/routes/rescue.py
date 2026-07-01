@@ -302,10 +302,11 @@ def accept_assignment(
 # Reject a Rescue Assignment
 # ======================
 # pyrefly: ignore [missing-import]
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from datetime import datetime
 
 class RejectAssignmentRequest(BaseModel):
-    reason: str = None
+    reason: str = Field(..., min_length=5, description="The reason for rejecting the assignment")
 
 @router.put("/assignments/{assignment_id}/reject")
 def reject_assignment(
@@ -327,6 +328,7 @@ def reject_assignment(
 
     StatusTransitionService.change_assignment_status(db, assignment.id, AssignmentStatus.REJECTED, current_user.id, "rescue", remarks=payload.reason)
     assignment.rejection_reason = payload.reason
+    assignment.rejected_at = datetime.utcnow()
     
     # Add a log entry to RescueUpdate
     db.add(RescueUpdate(

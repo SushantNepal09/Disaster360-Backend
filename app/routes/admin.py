@@ -69,7 +69,7 @@ def get_all_reports(
         .all()
     )
     
-    result = [serialize_incident(inc, current_user.id) for inc in incidents]
+    result = [serialize_incident(inc, current_user.id, is_admin=True) for inc in incidents]
     return {"total": len(result), "reports": result}
 
 
@@ -712,6 +712,9 @@ def undo_rescue_assignment(
     assignment = db.query(IncidentAssignment).filter(IncidentAssignment.id == assignment_id).first()
     if not assignment:
         raise HTTPException(status_code=404, detail="Assignment not found")
+        
+    if assignment.status != AssignmentStatus.ASSIGNED:
+        raise HTTPException(status_code=400, detail="This assignment can no longer be revoked because the rescue team has already responded.")
         
     incident_id = assignment.incident_id
     
