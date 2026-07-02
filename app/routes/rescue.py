@@ -79,7 +79,10 @@ def get_all_reports(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_rescue_team)
 ):
-    reports = db.query(Incident).filter(Incident.status.in_(["Verified", "Assigned"])).all()
+    reports = db.query(Incident).filter(
+        Incident.status.notin_(["Pending", "Rejected"]),
+        Incident.verified == True
+    ).all()
 
     data = []
     for r in reports:
@@ -98,6 +101,8 @@ def get_all_reports(
             "status": r.status,
             "verificationStatus": "Verified",
             "reportedAt": r.created_at.isoformat() if r.created_at else None,
+            "teamAssignmentStatus": team_assignment.status if team_assignment else None,
+            "isAssignedToCurrentTeam": team_assignment is not None,
             "location": {
                 "address": r.location,
                 "latitude": r.latitude,
@@ -111,8 +116,10 @@ def get_all_reports(
                 } for m in r.media
             ] if hasattr(r, "media") and r.media else [],
             "actions": {
-                "canAssign": False,
-                "canViewDetails": True
+                "canAcknowledge": bool(team_assignment and team_assignment.status == "Assigned"),
+                "canUpdateStatus": bool(team_assignment and team_assignment.status == "Accepted"),
+                "canSubmitReport": bool(team_assignment and team_assignment.status in ["In Progress", "Completed"]),
+                "rescueUpdateId": team_assignment.id if team_assignment else None
             }
         })
 
