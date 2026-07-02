@@ -351,7 +351,7 @@ def get_my_assignments(
 ):
     assignments = db.query(IncidentAssignment).filter(
         IncidentAssignment.team_id == current_user.id,
-        IncidentAssignment.status.notin_(["Cancelled", "Rejected"])
+        IncidentAssignment.status.notin_([AssignmentStatus.CANCELLED, AssignmentStatus.REJECTED, AssignmentStatus.COMPLETED])
     ).all()
 
     data = []
@@ -478,7 +478,7 @@ def get_rescue_home_feed(
 ):
     assignments = db.query(IncidentAssignment).filter(
         IncidentAssignment.team_id == current_user.id,
-        IncidentAssignment.status.notin_(["Cancelled", "Rejected"])
+        IncidentAssignment.status.notin_([AssignmentStatus.CANCELLED, AssignmentStatus.REJECTED, AssignmentStatus.COMPLETED])
     ).all()
 
     data = []
@@ -519,3 +519,81 @@ def get_rescue_home_feed(
     data.sort(key=lambda x: x["created_at"], reverse=True)
 
     return data
+
+
+# ======================
+# View Completed Assignments
+# ======================
+@router.get("/completed-assignments")
+def get_completed_assignments(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_rescue_team)
+):
+    assignments = db.query(IncidentAssignment).filter(
+        IncidentAssignment.team_id == current_user.id,
+        IncidentAssignment.status == AssignmentStatus.COMPLETED
+    ).all()
+
+    data = []
+    for a in assignments:
+        incident = a.incident
+        if not incident:
+            continue
+
+        rescue_update = db.query(RescueUpdate).filter(
+            RescueUpdate.incident_id == incident.id,
+            RescueUpdate.rescue_team_id == current_user.id
+        ).first()
+
+        reporter_name = "Unknown Reporter"
+        if incident.reports and len(incident.reports) > 0 and incident.reports[0].user:
+            reporter_name = incident.reports[0].user.full_name or incident.reports[0].user.email or "Unknown Reporter"
+
+        data.append({
+            "assignmentId": str(a.id),
+            "assignmentStatus": a.status,
+            "rejectionReason": a.rejection_reason,
+            "incidentId": str(incident.id),
+            "reporterName": reporter_name,
+            "reporterStatus": "Active",
+            "title": incident.title,
+            "disasterType": incident.disaster_type,
+            "description": incident.description,
+            "severity": incident.severity,
+            "status": a.status,
+            "verificationStatus": "Verified",
+            "assignedAt": a.assigned_at.isoformat() if a.assigned_at else None,
+            "completedAt": a.completed_at.isoformat() if hasattr(a, 'completed_at') and a.completed_at else None,
+            "reportedAt": incident.created_at.isoformat() if incident.created_at else None,
+            "location": {
+                "address": incident.location,
+                "latitude": incident.latitude,
+                "longitude": incident.longitude
+            },
+            "media": [
+                {
+                    "id": f"MED-{m.id}",
+                    "type": m.file_type,
+                    "url": m.file_path
+                } for m in incident.media
+            ] if hasattr(incident, "media") and incident.media else [],
+            "rescueTeam": {
+                "id": str(current_user.id),
+                "name": current_user.full_name or current_user.email
+            },
+            "actions": {
+                "canAcknowledge": False,
+                "canUpdateStatus": False,
+                "canSubmitReport": not rescue_update or not rescue_update.post_incident_report
+            },
+            "postIncidentReport": rescue_update.post_incident_report if rescue_update else None
+        })
+
+    # Sort by completed time (newest first) if available, else assigned_at
+    data.sort(key=lambda x: x["completedAt"] or x["assignedAt"] or "", reverse=True)
+
+    return {
+        "success": True,
+        "message": "Completed tasks fetched successfully",
+        "data": data
+    }

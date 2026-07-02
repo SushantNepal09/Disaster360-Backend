@@ -44,7 +44,7 @@ INCIDENT_TRANSITIONS: Dict[IncidentStatus, Set[IncidentStatus]] = {
     IncidentStatus.PENDING: {IncidentStatus.VERIFIED, IncidentStatus.REJECTED},
     IncidentStatus.VERIFIED: {IncidentStatus.ASSIGNED, IncidentStatus.PENDING}, # Admin can un-verify to pending
     IncidentStatus.ASSIGNED: {IncidentStatus.IN_PROGRESS, IncidentStatus.VERIFIED}, # Back to Verified if all assignments cancelled/rejected
-    IncidentStatus.IN_PROGRESS: {IncidentStatus.CONTROLLED, IncidentStatus.ASSIGNED}, # Back to assigned if team abandons
+    IncidentStatus.IN_PROGRESS: {IncidentStatus.CONTROLLED, IncidentStatus.ASSIGNED, IncidentStatus.CLOSED}, # Back to assigned if team abandons, or direct close
     IncidentStatus.CONTROLLED: {IncidentStatus.CLOSED, IncidentStatus.IN_PROGRESS}, # Re-open incident if needed
     IncidentStatus.CLOSED: {IncidentStatus.IN_PROGRESS, IncidentStatus.CONTROLLED}, # Re-open
     IncidentStatus.REJECTED: {IncidentStatus.PENDING}, # Accidental rejection recovery
@@ -83,6 +83,7 @@ INCIDENT_PERMISSIONS = {
     (IncidentStatus.ASSIGNED, IncidentStatus.VERIFIED): {"admin"}, # Auto-revert if no teams
     (IncidentStatus.ASSIGNED, IncidentStatus.IN_PROGRESS): {"admin", "rescue"}, # Auto-sync when team starts
     (IncidentStatus.IN_PROGRESS, IncidentStatus.CONTROLLED): {"admin"}, # Admin confirms controlled
+    (IncidentStatus.IN_PROGRESS, IncidentStatus.CLOSED): {"admin"}, # Admin directly closes
     (IncidentStatus.IN_PROGRESS, IncidentStatus.ASSIGNED): {"admin"},
     (IncidentStatus.CONTROLLED, IncidentStatus.CLOSED): {"admin"},
     (IncidentStatus.CONTROLLED, IncidentStatus.IN_PROGRESS): {"admin"},

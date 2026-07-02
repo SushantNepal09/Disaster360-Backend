@@ -24,6 +24,7 @@ class Incident(Base):
     verified = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.now(timezone.utc))
+    final_admin_report = Column(Text, nullable=True)
 
     # Calculate trust aggregation based on report count or trust score
     sources = Column(Integer, default=1)

@@ -770,3 +770,124 @@ def get_incident_history(
         "success": True,
         "data": data
     }
+
+
+# ======================
+# Get Completed Operations (Awaiting Final Review)
+# ======================
+@router.get("/completed-operations")
+def get_completed_operations(
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(get_current_admin)
+):
+    from app.models.incident_assignment import IncidentAssignment
+    from app.core.statuses import AssignmentStatus
+    from app.models.rescue_update import RescueUpdate
+
+    # Get all assignments that are active or completed
+    all_assignments = db.query(IncidentAssignment).filter(
+        IncidentAssignment.status.notin_([AssignmentStatus.CANCELLED, AssignmentStatus.REJECTED])
+    ).all()
+
+    # Group assignments by incident ID
+    incident_groups = {}
+    for a in all_assignments:
+        incident_groups.setdefault(a.incident_id, []).append(a)
+
+    # Filter incidents where ALL assignments are COMPLETED
+    completed_incident_ids = [
+        inc_id for inc_id, group in incident_groups.items()
+        if all(a.status == AssignmentStatus.COMPLETED for a in group) and len(group) > 0
+    ]
+
+    incidents = db.query(Incident).filter(Incident.id.in_(completed_incident_ids)).all()
+
+    result = []
+    for inc in incidents:
+        # Fetch individual team reports for this incident
+        rescue_updates = db.query(RescueUpdate).filter(RescueUpdate.incident_id == inc.id).all()
+        team_reports = []
+        for a in incident_groups[inc.id]:
+            team_user = db.query(User).filter(User.id == a.team_id).first()
+            team_name = team_user.full_name if team_user else "Unknown Team"
+            
+            # Find report for this team
+            update = next((ru for ru in rescue_updates if ru.rescue_team_id == a.team_id and ru.post_incident_report), None)
+            
+            team_reports.append({
+                "team_id": str(a.team_id) if a.team_id else None,
+                "team_name": team_name,
+                "completed_at": a.completed_at.isoformat() if a.completed_at else None,
+                "report": update.post_incident_report if update else None
+            })
+
+        result.append({
+            "incident_id": str(inc.id),
+            "title": inc.title,
+            "disaster_type": inc.disaster_type,
+            "description": inc.description,
+            "severity": inc.severity,
+            "location": {
+                "address": inc.location,
+                "latitude": inc.latitude,
+                "longitude": inc.longitude
+            },
+            "status": inc.status,
+            "created_at": inc.created_at.isoformat() if inc.created_at else None,
+            "teams": team_reports
+        })
+
+    return {
+        "success": True,
+        "message": "Completed operations fetched successfully",
+        "data": result
+    }
+
+class FinalReportRequest(BaseModel):
+    final_report: str
+
+# ======================
+# Submit Final Admin Report (Close Incident)
+# ======================
+@router.post("/incidents/{incident_id}/final-report")
+def submit_final_admin_report(
+    incident_id: int,
+    payload: FinalReportRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(get_current_admin)
+):
+    incident = db.query(Incident).filter(Incident.id == incident_id).first()
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+        
+    # Set final report and transition to CLOSED
+    incident.final_admin_report = payload.final_report
+    
+    StatusTransitionService.change_incident_status(
+        db, incident.id, IncidentStatus.CLOSED, current_admin.id, "admin", remarks="Final admin review completed"
+    )
+    
+    db.commit()
+    db.refresh(incident)
+
+    # Send Notification to reporters
+    DISASTER_RADIUS_KM = {"flood": 5.0, "landslide": 3.0, "earthquake": 50.0, "fire": 2.0, "default": 5.0}
+    radius_km = DISASTER_RADIUS_KM.get(incident.disaster_type.lower() if incident.disaster_type else "default", 5.0)
+    nearby_users = get_users_to_notify(db, incident.latitude, incident.longitude, radius_km) if incident.latitude and incident.longitude else []
+    user_ids = [str(u.id) for u in nearby_users]
+    if user_ids:
+        background_tasks.add_task(
+            send_push_notification_task,
+            user_ids,
+            NotificationType.INCIDENT_CLOSED,
+            "Incident Resolved",
+            "The disaster has been officially resolved. Stay safe.",
+            {"incident_id": str(incident.id)}
+        )
+
+    return {
+        "message": "Final report submitted and incident closed successfully",
+        "incident_id": incident.id
+    }
+

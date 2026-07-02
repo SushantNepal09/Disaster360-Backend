@@ -144,8 +144,10 @@ def serialize_incident(inc, current_user_id=None, is_admin=False):
                 
     session = object_session(inc)
     is_accepted = False
+    rescue_updates = []
     if session:
-        is_accepted = session.query(RescueUpdate).filter(RescueUpdate.incident_id == inc.id).first() is not None
+        rescue_updates = session.query(RescueUpdate).filter(RescueUpdate.incident_id == inc.id).all()
+        is_accepted = len(rescue_updates) > 0
 
     return {
         "id": inc.id,
@@ -167,6 +169,7 @@ def serialize_incident(inc, current_user_id=None, is_admin=False):
         "user_reaction": user_reaction,
         "submissions": submissions,
         "assigned_teams": [a.team_name for a in getattr(inc, 'assignments', []) if a.status != 'Cancelled'],
+        "final_admin_report": getattr(inc, 'final_admin_report', None),
         "assignments": [
             {
                 "id": str(a.id),
@@ -178,6 +181,7 @@ def serialize_incident(inc, current_user_id=None, is_admin=False):
                 "rejected_at": getattr(a, 'rejected_at', None).isoformat() if is_admin and getattr(a, 'rejected_at', None) else None,
                 "completed_at": getattr(a, 'completed_at', None).isoformat() if getattr(a, 'completed_at', None) else None,
                 "last_updated": getattr(a, 'updated_at', None).isoformat() if getattr(a, 'updated_at', None) else None,
+                "post_incident_report": next((ru.post_incident_report for ru in rescue_updates if ru.rescue_team_id == a.team_id and ru.post_incident_report), None)
             } for a in getattr(inc, 'assignments', []) if a.status != 'Cancelled'
         ],
         "rescue_team": ", ".join([a.team_name for a in getattr(inc, 'assignments', []) if a.status != 'Cancelled']) or "Not Assigned",
