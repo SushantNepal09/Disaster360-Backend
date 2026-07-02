@@ -24,15 +24,37 @@ def get_notifications(
         .all()
     )
     
+    # pyrefly: ignore [missing-import]
+    from ..models.incident import Incident
+    from ..models.report import Report
+    from ..models.user import User as UserModel
+    
     result = []
     for n in notifications:
+        reporter_name = None
+        disaster_type = None
+        
+        if n.incident_id:
+            incident = db.query(Incident).filter(Incident.id == n.incident_id).first()
+            if incident:
+                disaster_type = incident.disaster_type
+                # Assuming the first report created the incident
+                first_report = db.query(Report).filter(Report.incident_id == incident.id).order_by(Report.created_at).first()
+                if first_report and first_report.user_id:
+                    reporter = db.query(UserModel).filter(UserModel.id == first_report.user_id).first()
+                    if reporter:
+                        reporter_name = reporter.full_name
+
         result.append({
             "id": n.id,
             "type": n.notification_type,
             "title": n.title,
             "message": n.body,
             "time": n.sent_at.isoformat() + "Z",
-            "is_read": n.is_read
+            "is_read": n.is_read,
+            "incident_id": n.incident_id,
+            "reporter_name": reporter_name,
+            "disaster_type": disaster_type
         })
         
     return result
