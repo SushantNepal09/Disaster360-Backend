@@ -7,7 +7,7 @@ from app.core.statuses import IncidentStatus
 
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import relationship
-from ..database import Base
+from app.database import Base
 
 class Incident(Base):
     __tablename__ = "incidents"
