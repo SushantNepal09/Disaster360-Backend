@@ -5,6 +5,7 @@ from sqlalchemy import Column, Integer, String, Text, Float, ForeignKey, DateTim
 # pyrefly: ignore [missing-import]
 from sqlalchemy.dialects.postgresql import UUID
 from datetime import datetime, timezone
+from app.core.statuses import ReportStatus
 
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import relationship
@@ -27,7 +28,7 @@ class Report(Base):
     
     timestamp = Column(DateTime, default=datetime.utcnow)
     trust_score_snapshot = Column(Float, default=1.0)
-    status = Column(String, default="Pending")
+    status = Column(String, default=ReportStatus.PENDING)
     verified = Column(Boolean, default=False)
     
     incident = relationship("Incident", back_populates="reports")

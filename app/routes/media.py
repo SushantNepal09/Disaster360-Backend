@@ -6,11 +6,11 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import List
 
-from ..database import get_db
-from ..models.report import Report
-from ..models.report_media import ReportMedia
-from ..models.user import User
-from .auth import get_current_user  
+from app.database import get_db
+from app.models.report import Report
+from app.models.report_media import ReportMedia
+from app.models.user import User
+from app.routes.auth import get_current_user  
 
 # Changed prefix to mount under /reports
 router = APIRouter(prefix="/reports", tags=["Media"])
@@ -40,7 +40,7 @@ def attach_media(
         if "supabase.co" not in url:
             raise HTTPException(status_code=400, detail=f"Invalid media URL: {url}. Only Supabase URLs are allowed.")
 
-    from ..models.incident import Incident
+    from app.models.incident import Incident
 
     # Check incident exists
     incident = db.query(Incident).filter(Incident.id == report_id).first()

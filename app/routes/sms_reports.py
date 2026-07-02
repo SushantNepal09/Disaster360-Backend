@@ -6,10 +6,10 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 import json
 
-from ..database import get_db
-from ..models import SmsReport
-from ..auth.api_key import verify_sms_api_key
-from .reports import process_disaster_report, ReportCreateRequest
+from app.database import get_db
+from app.models import SmsReport
+from app.auth.api_key import verify_sms_api_key
+from app.routes.reports import process_disaster_report, ReportCreateRequest
 
 router = APIRouter(prefix="/sms-reports", tags=["SMS Gateway"])
 

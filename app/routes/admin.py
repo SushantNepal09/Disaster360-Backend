@@ -7,17 +7,20 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional, List
 
-from ..database import get_db
-from ..models.incident import Incident
-from ..models.incident_assignment import IncidentAssignment
-from ..models.report import Report
-from ..models.report_reaction import ReportReaction
-from ..models.user import User
-from .auth import get_current_admin
+# pyrefly: ignore [missing-import]
+from app.database import get_db
+from app.models.incident import Incident
+from app.models.incident_assignment import IncidentAssignment
+from app.models.report import Report
+from app.models.report_reaction import ReportReaction
+from app.models.user import User
+from app.routes.auth import get_current_admin
 from datetime import datetime, timedelta, timezone
 
-from ..services.geo_service import get_users_to_notify
-from ..services.notification_service import send_push_notification_task, NotificationType
+from app.services.geo_service import get_users_to_notify
+from app.services.notification_service import send_push_notification_task, NotificationType
+from app.services.status_transition_service import StatusTransitionService
+from app.core.statuses import IncidentStatus, ReportStatus, AssignmentStatus
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 
@@ -26,7 +29,7 @@ router = APIRouter(prefix="/admin", tags=["Admin"])
 # Pydantic Schemas
 # ======================
 class AssignTeamRequest(BaseModel):
-    team_names: List[str]
+    team_ids: list[str] = []
 
 
 class StatusUpdateRequest(BaseModel):
@@ -55,7 +58,7 @@ def get_all_reports(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_admin)
 ):
-    from .reports import serialize_incident
+    from app.routes.reports import serialize_incident
     
     incidents = (
         db.query(Incident)
@@ -66,7 +69,7 @@ def get_all_reports(
         .all()
     )
     
-    result = [serialize_incident(inc, current_user.id) for inc in incidents]
+    result = [serialize_incident(inc, current_user.id, is_admin=True) for inc in incidents]
     return {"total": len(result), "reports": result}
 
 
@@ -128,13 +131,7 @@ def verify_report(
         raise HTTPException(status_code=404, detail="Report not found")
 
     # Mark the incident as verified
-    incident.status = "Verified"
-    incident.verified = True
-
-    # Mark every linked report as verified
-    for r in incident.reports:
-        r.status = "Verified"
-        r.verified = True
+    StatusTransitionService.change_incident_status(db, incident.id, IncidentStatus.VERIFIED, current_user.id, "admin", remarks="Admin manually verified")
 
     db.commit()
     db.refresh(incident)
@@ -187,8 +184,7 @@ def update_submission_status(
     if not sub:
         raise HTTPException(status_code=404, detail="Submission not found")
 
-    sub.status = payload.status
-    sub.verified = (payload.status == "Verified")
+    StatusTransitionService.change_report_status(db, sub.id, payload.status, current_user.id, "admin")
     db.commit()
 
     return {"message": f"Submission status updated to {payload.status}"}
@@ -207,12 +203,7 @@ def unverify_report(
     if not incident:
         raise HTTPException(status_code=404, detail="Report not found")
 
-    incident.status = "Pending"
-    incident.verified = False
-
-    for r in incident.reports:
-        r.status = "Pending"
-        r.verified = False
+    StatusTransitionService.change_incident_status(db, incident.id, IncidentStatus.PENDING, current_user.id, "admin", remarks="Admin unverified")
 
     db.commit()
     db.refresh(incident)
@@ -237,34 +228,28 @@ def update_report_status(
     allowed_status = [
         "Pending",
         "Verified",
+        "Assigned",
         "Verified Rescue In Progress",
         "Verified Controlled",
         "Verified and Closed"
     ]
 
-    if payload.status not in allowed_status:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid status. Allowed values: {allowed_status}"
-        )
-
     incident = db.query(Incident).filter(Incident.id == report_id).first()
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
 
-    incident.status = payload.status
-
-    # Cascade the status to all linked reports
-    for r in incident.reports:
-        r.status = payload.status
+    # The service automatically validates the transition
+    StatusTransitionService.change_incident_status(
+        db, incident.id, payload.status, current_user.id, "admin", remarks="Admin status update"
+    )
 
     db.commit()
     db.refresh(incident)
 
-    if payload.status == "Verified and Closed":
+    if payload.status == IncidentStatus.CLOSED:
         DISASTER_RADIUS_KM = {"flood": 5.0, "landslide": 3.0, "earthquake": 50.0, "fire": 2.0, "default": 5.0}
         radius_km = DISASTER_RADIUS_KM.get(incident.disaster_type.lower() if incident.disaster_type else "default", 5.0)
-        nearby_users = get_users_in_radius(db, incident.latitude, incident.longitude, radius_km) if incident.latitude and incident.longitude else []
+        nearby_users = get_users_to_notify(db, incident.latitude, incident.longitude, radius_km) if incident.latitude and incident.longitude else []
         user_ids = [str(u.id) for u in nearby_users]
         if user_ids:
             background_tasks.add_task(
@@ -300,12 +285,39 @@ def admin_assign_team(
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
 
-    # Clear existing assignments
-    db.query(IncidentAssignment).filter(IncidentAssignment.incident_id == incident.id).delete()
+    if incident.status == IncidentStatus.PENDING:
+        raise HTTPException(status_code=400, detail="Pending reports cannot be assigned to rescue teams")
 
-    # Add new ones
-    for t in payload.team_names:
-        db.add(IncidentAssignment(incident_id=incident.id, team_name=t))
+    # Soft Cancel missing active assignments instead of deleting them
+    existing_assignments = db.query(IncidentAssignment).filter(IncidentAssignment.incident_id == incident.id).all()
+    payload_team_ids = [str(t) for t in (payload.team_ids or [])]
+    
+    for a in existing_assignments:
+        # Treat None as active in case of rogue legacy data
+        if str(a.team_id) not in payload_team_ids and (a.status in [AssignmentStatus.ASSIGNED, AssignmentStatus.ACCEPTED, AssignmentStatus.IN_PROGRESS] or a.status is None):
+            StatusTransitionService.change_assignment_status(db, a.id, AssignmentStatus.CANCELLED, current_user.id, "admin", remarks="Unassigned by admin")
+            
+    assigned_users = []
+    if payload.team_ids:
+        assigned_users = db.query(User).filter(User.id.in_(payload.team_ids)).all()
+        
+    for u in assigned_users:
+        # Check if already assigned actively
+        already_active = any(str(a.team_id) == str(u.id) and (a.status in [AssignmentStatus.ASSIGNED, AssignmentStatus.ACCEPTED, AssignmentStatus.IN_PROGRESS] or a.status is None) for a in existing_assignments)
+        if not already_active:
+            new_assign = IncidentAssignment(
+                incident_id=incident.id, 
+                team_name=u.full_name or u.email, 
+                team_id=u.id,
+                status=AssignmentStatus.ASSIGNED
+            )
+            db.add(new_assign)
+            db.flush()
+            StatusTransitionService._record_history(db, 'Assignment', new_assign.id, None, AssignmentStatus.ASSIGNED, current_user.id, "Admin assigned team")
+
+    # The Transition Service will handle syncing Incident status automatically via change_assignment_status
+    # For newly created assignments, we manually trigger the sync:
+    StatusTransitionService._update_derived_statuses(db, incident.id, current_user.id, "admin")
 
     db.commit()
     db.refresh(incident)
@@ -324,7 +336,7 @@ def admin_assign_team(
     return {
         "message": "Teams assigned successfully",
         "report_id": incident.id,
-        "assigned_teams": payload.team_names,
+        "assigned_teams": payload.team_ids,
         "assigned_by": current_user.email
     }
 
@@ -365,11 +377,7 @@ def admin_reject_report(
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
 
-    incident.status = "Rejected"
-    
-    # Cascade rejection to linked reports
-    for r in incident.reports:
-        r.status = "Rejected"
+    StatusTransitionService.change_incident_status(db, incident.id, IncidentStatus.REJECTED, current_user.id, "admin", remarks="Rejected by admin")
 
     db.commit()
 
@@ -392,11 +400,11 @@ def admin_undo_reject_report(
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
 
-    incident.status = "Pending"
-    
-    # Cascade undo rejection to linked reports
+    StatusTransitionService.change_incident_status(db, incident.id, IncidentStatus.PENDING, current_user.id, "admin", remarks="Undo reject by admin")
+    # Restore linked reports that were auto-rejected
     for r in incident.reports:
-        r.status = "Pending"
+        if r.status == ReportStatus.REJECTED:
+            StatusTransitionService.change_report_status(db, r.id, ReportStatus.PENDING, current_user.id, "admin", remarks="Auto-restored because incident was restored")
 
     db.commit()
 
@@ -413,19 +421,27 @@ def get_active_rescues(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_admin)
 ):
-    from ..models.rescue_update import RescueUpdate
-    operations = db.query(RescueUpdate).filter(RescueUpdate.status != "Closed").all()
+    from app.models.incident_assignment import IncidentAssignment
+    from app.core.statuses import AssignmentStatus
+    
+    operations = db.query(IncidentAssignment).filter(
+        IncidentAssignment.status.notin_([
+            AssignmentStatus.COMPLETED,
+            AssignmentStatus.CANCELLED,
+            AssignmentStatus.REJECTED
+        ])
+    ).all()
     
     result = []
     for op in operations:
         incident = db.query(Incident).filter(Incident.id == op.incident_id).first()
-        team_user = db.query(User).filter(User.id == op.rescue_team_id).first()
+        team_user = db.query(User).filter(User.id == op.team_id).first()
         
         result.append({
             "initials": "".join([part[0] for part in team_user.full_name.split()[:2]]).upper() if team_user and team_user.full_name else "RT",
             "name": team_user.full_name if team_user else "Unknown Team",
             "locationStatus": f"{incident.location if incident and incident.location else 'Unknown'} — {op.status}",
-            "badge": "Active" if op.is_acknowledged else "Dispatch",
+            "badge": "Active" if op.status in [AssignmentStatus.ACCEPTED, AssignmentStatus.IN_PROGRESS] else "Dispatch",
             "reportType": incident.disaster_type if incident else "Unknown",
             "title": incident.title if incident else "Unknown",
             "flag": op.status
@@ -676,5 +692,202 @@ def get_analytics(
         "topReporters": top_reporters_list,
         "rescueTeams": rescue_teams,
         "responseTime": response_time
+    }
+
+
+# ======================
+# Undo Rescue Assignment
+# ======================
+@router.delete("/assignments/{assignment_id}")
+def undo_rescue_assignment(
+    assignment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin)
+):
+    # pyrefly: ignore [missing-import]
+    from app.models.incident_assignment import IncidentAssignment
+    # pyrefly: ignore [missing-import]
+    from app.models.incident import Incident
+    
+    assignment = db.query(IncidentAssignment).filter(IncidentAssignment.id == assignment_id).first()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+        
+    if assignment.status != AssignmentStatus.ASSIGNED:
+        raise HTTPException(status_code=400, detail="This assignment can no longer be revoked because the rescue team has already responded.")
+        
+    incident_id = assignment.incident_id
+    
+    # Soft delete the assignment via transition service which auto-syncs the incident
+    StatusTransitionService.change_assignment_status(db, assignment.id, AssignmentStatus.CANCELLED, current_user.id, "admin", remarks="Cancelled by admin")
+    db.commit()
+
+    return {"message": f"Assignment {assignment_id} successfully cancelled"}
+
+# ======================
+# Get Status History for an Incident
+# ======================
+@router.get("/incidents/{incident_id}/history")
+def get_incident_history(
+    incident_id: int,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(get_current_admin)
+):
+    # pyrefly: ignore [missing-import]
+    from app.models.status_history import StatusHistory
+    
+    # We want history of the Incident itself, and any Assignments belonging to this Incident.
+    assignments = db.query(IncidentAssignment).filter(IncidentAssignment.incident_id == incident_id).all()
+    assignment_ids = [a.id for a in assignments]
+
+    # Query StatusHistory
+    history_records = db.query(StatusHistory).filter(
+        ((StatusHistory.entity_type == "Incident") & (StatusHistory.entity_id == incident_id)) |
+        ((StatusHistory.entity_type == "Assignment") & (StatusHistory.entity_id.in_(assignment_ids)))
+    ).order_by(StatusHistory.timestamp.desc()).all()
+
+    data = []
+    for h in history_records:
+        role = "System"
+        if h.changed_by:
+            user = db.query(User).filter(User.id == h.changed_by).first()
+            if user:
+                role = user.role.value if hasattr(user.role, 'value') else str(user.role)
+        
+        data.append({
+            "id": h.id,
+            "entity_type": h.entity_type,
+            "entity_id": h.entity_id,
+            "old_status": h.old_status,
+            "new_status": h.new_status,
+            "changed_by": str(h.changed_by) if h.changed_by else None,
+            "changed_by_role": role,
+            "remarks": h.remarks,
+            "created_at": h.timestamp.isoformat() if h.timestamp else None
+        })
+
+    return {
+        "success": True,
+        "data": data
+    }
+
+
+# ======================
+# Get Completed Operations (Awaiting Final Review)
+# ======================
+@router.get("/completed-operations")
+def get_completed_operations(
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(get_current_admin)
+):
+    from app.models.incident_assignment import IncidentAssignment
+    from app.core.statuses import AssignmentStatus
+    from app.models.rescue_update import RescueUpdate
+
+    # Get all assignments that are active or completed
+    all_assignments = db.query(IncidentAssignment).filter(
+        IncidentAssignment.status.notin_([AssignmentStatus.CANCELLED, AssignmentStatus.REJECTED])
+    ).all()
+
+    # Group assignments by incident ID
+    incident_groups = {}
+    for a in all_assignments:
+        incident_groups.setdefault(a.incident_id, []).append(a)
+
+    # Filter incidents where ALL assignments are COMPLETED
+    completed_incident_ids = [
+        inc_id for inc_id, group in incident_groups.items()
+        if all(a.status == AssignmentStatus.COMPLETED for a in group) and len(group) > 0
+    ]
+
+    incidents = db.query(Incident).filter(Incident.id.in_(completed_incident_ids)).all()
+
+    result = []
+    for inc in incidents:
+        # Fetch individual team reports for this incident
+        rescue_updates = db.query(RescueUpdate).filter(RescueUpdate.incident_id == inc.id).all()
+        team_reports = []
+        for a in incident_groups[inc.id]:
+            team_user = db.query(User).filter(User.id == a.team_id).first()
+            team_name = team_user.full_name if team_user else "Unknown Team"
+            
+            # Find report for this team
+            update = next((ru for ru in rescue_updates if ru.rescue_team_id == a.team_id and ru.post_incident_report), None)
+            
+            team_reports.append({
+                "team_id": str(a.team_id) if a.team_id else None,
+                "team_name": team_name,
+                "completed_at": a.completed_at.isoformat() if a.completed_at else None,
+                "report": update.post_incident_report if update else None
+            })
+
+        result.append({
+            "incident_id": str(inc.id),
+            "title": inc.title,
+            "disaster_type": inc.disaster_type,
+            "description": inc.description,
+            "severity": inc.severity,
+            "location": {
+                "address": inc.location,
+                "latitude": inc.latitude,
+                "longitude": inc.longitude
+            },
+            "status": inc.status,
+            "created_at": inc.created_at.isoformat() if inc.created_at else None,
+            "teams": team_reports
+        })
+
+    return {
+        "success": True,
+        "message": "Completed operations fetched successfully",
+        "data": result
+    }
+
+class FinalReportRequest(BaseModel):
+    final_report: str
+
+# ======================
+# Submit Final Admin Report (Close Incident)
+# ======================
+@router.post("/incidents/{incident_id}/final-report")
+def submit_final_admin_report(
+    incident_id: int,
+    payload: FinalReportRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(get_current_admin)
+):
+    incident = db.query(Incident).filter(Incident.id == incident_id).first()
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+        
+    # Set final report and transition to CLOSED
+    incident.final_admin_report = payload.final_report
+    
+    StatusTransitionService.change_incident_status(
+        db, incident.id, IncidentStatus.CLOSED, current_admin.id, "admin", remarks="Final admin review completed"
+    )
+    
+    db.commit()
+    db.refresh(incident)
+
+    # Send Notification to reporters
+    DISASTER_RADIUS_KM = {"flood": 5.0, "landslide": 3.0, "earthquake": 50.0, "fire": 2.0, "default": 5.0}
+    radius_km = DISASTER_RADIUS_KM.get(incident.disaster_type.lower() if incident.disaster_type else "default", 5.0)
+    nearby_users = get_users_to_notify(db, incident.latitude, incident.longitude, radius_km) if incident.latitude and incident.longitude else []
+    user_ids = [str(u.id) for u in nearby_users]
+    if user_ids:
+        background_tasks.add_task(
+            send_push_notification_task,
+            user_ids,
+            NotificationType.INCIDENT_CLOSED,
+            "Incident Resolved",
+            "The disaster has been officially resolved. Stay safe.",
+            {"incident_id": str(incident.id)}
+        )
+
+    return {
+        "message": "Final report submitted and incident closed successfully",
+        "incident_id": incident.id
     }
 

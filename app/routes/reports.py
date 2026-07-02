@@ -7,15 +7,18 @@ from pydantic import BaseModel
 from typing import List, Optional, Union
 import math
 from datetime import datetime
-from ..database import get_db
-from ..models.incident import Incident
-from ..models.report import Report
-from ..models.user import User
-from .auth import get_current_user, get_optional_current_user
-from ..models.report_embedding import ReportEmbedding
-from ..models.report_reaction import ReportReaction, ReactionType
-from ..services.geo_service import get_users_to_notify
-from ..services.notification_service import send_push_notification_task, NotificationType
+from app.database import get_db
+from app.models.incident import Incident
+from app.models.report import Report
+from app.models.user import User
+from app.routes.auth import get_current_user, get_optional_current_user
+from app.models.report_embedding import ReportEmbedding
+from app.models.rescue_update import RescueUpdate
+# pyrefly: ignore [missing-import]
+from sqlalchemy.orm import object_session
+from app.models.report_reaction import ReportReaction, ReactionType
+from app.services.geo_service import get_users_to_notify
+from app.services.notification_service import send_push_notification_task, NotificationType
 
 # pyrefly: ignore [missing-import]
 from google.genai import Client
@@ -85,7 +88,7 @@ def calculate_distance(lat1, lon1, lat2, lon2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
-def serialize_incident(inc, current_user_id=None):
+def serialize_incident(inc, current_user_id=None, is_admin=False):
     submissions = []
     
     # Pre-fetch all media and reactions
@@ -130,13 +133,21 @@ def serialize_incident(inc, current_user_id=None):
             "user_reaction": child_user_reaction
         })
 
-    # Parent reactions (only those not attached to any child report)
-    parent_likes = sum(1 for rx in all_reactions if rx.reaction_type.value == "LIKE" and rx.report_id is None)
-    parent_dislikes = sum(1 for rx in all_reactions if rx.reaction_type.value == "DISLIKE" and rx.report_id is None)
-    parent_user_reaction = next((rx.reaction_type.value for rx in all_reactions if rx.report_id is None and str(rx.user_id) == str(current_user_id)), None)
-
-    # Parent media (only those not attached to any child report)
-    parent_media = [m.file_path for m in all_media if m.file_type == "image" and m.report_id is None]
+    likes = sum(1 for r in getattr(inc, 'reactions', []) if r.reaction_type.value == "LIKE")
+    dislikes = sum(1 for r in getattr(inc, 'reactions', []) if r.reaction_type.value == "DISLIKE")
+    user_reaction = None
+    if current_user_id:
+        for r in getattr(inc, 'reactions', []):
+            if str(r.user_id) == str(current_user_id):
+                user_reaction = r.reaction_type.value
+                break
+                
+    session = object_session(inc)
+    is_accepted = False
+    rescue_updates = []
+    if session:
+        rescue_updates = session.query(RescueUpdate).filter(RescueUpdate.incident_id == inc.id).all()
+        is_accepted = len(rescue_updates) > 0
 
     return {
         "id": inc.id,
@@ -153,13 +164,29 @@ def serialize_incident(inc, current_user_id=None):
         "created_at": inc.created_at,
         "updated_at": inc.updated_at,
         "sources": inc.sources or len(submissions),
-        "likes": parent_likes,
-        "dislikes": parent_dislikes,
-        "user_reaction": parent_user_reaction,
+        "likes": likes,
+        "dislikes": dislikes,
+        "user_reaction": user_reaction,
         "submissions": submissions,
-        "assigned_teams": [a.team_name for a in getattr(inc, 'assignments', [])],
-        "rescue_team": ", ".join([a.team_name for a in getattr(inc, 'assignments', [])]) if getattr(inc, 'assignments', None) else "Not Assigned",
-        "media_urls": list(set(parent_media))
+        "assigned_teams": [a.team_name for a in getattr(inc, 'assignments', []) if a.status != 'Cancelled'],
+        "final_admin_report": getattr(inc, 'final_admin_report', None),
+        "assignments": [
+            {
+                "id": str(a.id),
+                "team_id": str(a.team_id),
+                "team_name": a.team_name,
+                "status": a.status if a.status else "Assigned",
+                "accepted_at": getattr(a, 'accepted_at', None).isoformat() if getattr(a, 'accepted_at', None) else None,
+                "rejection_reason": getattr(a, 'rejection_reason', None) if is_admin else None,
+                "rejected_at": getattr(a, 'rejected_at', None).isoformat() if is_admin and getattr(a, 'rejected_at', None) else None,
+                "completed_at": getattr(a, 'completed_at', None).isoformat() if getattr(a, 'completed_at', None) else None,
+                "last_updated": getattr(a, 'updated_at', None).isoformat() if getattr(a, 'updated_at', None) else None,
+                "post_incident_report": next((ru.post_incident_report for ru in rescue_updates if ru.rescue_team_id == a.team_id and ru.post_incident_report), None)
+            } for a in getattr(inc, 'assignments', []) if a.status != 'Cancelled'
+        ],
+        "rescue_team": ", ".join([a.team_name for a in getattr(inc, 'assignments', []) if a.status != 'Cancelled']) or "Not Assigned",
+        "is_accepted": is_accepted,
+        "media_urls": [m.file_path for m in inc.media if m.file_type == "image"] if hasattr(inc, "media") and inc.media else []
     }
 
 def process_disaster_report(payload: ReportCreateRequest, db: Session, user_id: str | None = None):
@@ -346,7 +373,8 @@ def get_reports(db: Session = Depends(get_db), current_user: User | None = Depen
         .all()
     )
     user_id = current_user.id if current_user else None
-    return [serialize_incident(inc, user_id) for inc in incidents if inc.reports]
+    is_admin_flag = current_user is not None and current_user.role == "admin"
+    return [serialize_incident(inc, user_id, is_admin=is_admin_flag) for inc in incidents if inc.reports]
 
 @router.get("/verified", response_model=List[dict])
 def get_verified_reports(db: Session = Depends(get_db), current_user: User | None = Depends(get_optional_current_user)):
@@ -405,7 +433,8 @@ def get_report(report_id: int, db: Session = Depends(get_db), current_user: User
     inc = db.query(Incident).filter(Incident.id == report_id).options(joinedload(Incident.reports).joinedload(Report.user), joinedload(Incident.reactions)).first()
     if not inc: raise HTTPException(status_code=404, detail="Incident not found")
     user_id = current_user.id if current_user else None
-    return serialize_incident(inc, user_id)
+    is_admin_flag = current_user is not None and current_user.role == "admin"
+    return serialize_incident(inc, user_id, is_admin=is_admin_flag)
 
 @router.put("/{report_id}")
 def update_report(
