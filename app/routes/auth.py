@@ -17,15 +17,15 @@ from datetime import datetime, timedelta, timezone
 # pyrefly: ignore [missing-import]
 from pydantic import BaseModel, EmailStr
 
-from ..database import get_db
-from ..models.user import User
-from ..auth.auth_utils import (
+from app.database import get_db
+from app.models.user import User
+from app.auth.auth_utils import (
     hash_password,
     verify_password,
     create_access_token,
     verify_access_token,
 )
-from ..auth.email_service import send_verification_email
+from app.auth.email_service import send_verification_email
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 

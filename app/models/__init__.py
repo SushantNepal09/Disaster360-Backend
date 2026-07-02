@@ -10,4 +10,4 @@ from .report_embedding import ReportEmbedding
 from .report_reaction import ReportReaction
 from .incident_assignment import IncidentAssignment
 from .sms_report import SmsReport
-
+from .status_history import StatusHistory

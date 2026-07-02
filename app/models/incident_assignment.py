@@ -1,10 +1,13 @@
 
 # pyrefly: ignore [missing-import]
+# pyrefly: ignore [missing-import]
 from sqlalchemy import Column, Integer, String, ForeignKey, DateTime
 from datetime import datetime, timezone
+from app.core.statuses import AssignmentStatus
 
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import relationship
+# pyrefly: ignore [missing-import]
 from ..database import Base
 
 # pyrefly: ignore [missing-import]
@@ -18,7 +21,7 @@ class IncidentAssignment(Base):
     team_name = Column(String, nullable=False)
     team_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
     
-    status = Column(String, default="Assigned") # Assigned, Accepted, Rejected, In Progress, Completed, Cancelled
+    status = Column(String, default=AssignmentStatus.ASSIGNED)
     
     assigned_at = Column(DateTime, default=datetime.utcnow)
     accepted_at = Column(DateTime, nullable=True)
