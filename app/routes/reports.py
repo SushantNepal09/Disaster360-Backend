@@ -13,6 +13,7 @@ from app.models.report import Report
 from app.models.user import User
 from app.routes.auth import get_current_user, get_optional_current_user
 from app.models.report_embedding import ReportEmbedding
+from app.models.rescue_timeline_event import RescueTimelineEvent
 from app.models.rescue_update import RescueUpdate
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import object_session
@@ -256,6 +257,17 @@ def process_disaster_report(payload: ReportCreateRequest, db: Session, user_id: 
         db.add(new_report)
         db.commit()
         db.refresh(new_report)
+        
+        event = RescueTimelineEvent(
+            incident_id=matched_incident.id,
+            created_by=user_id,
+            event_type="SYSTEM",
+            title=f"Citizen submitted {payload.disaster_type} report",
+            is_system_generated=True,
+            created_at=datetime.utcnow()
+        )
+        db.add(event)
+        db.commit()
 
         distance_km = nearby_distances.get(matched_incident.id, 0.0)
 
@@ -294,6 +306,17 @@ def process_disaster_report(payload: ReportCreateRequest, db: Session, user_id: 
 
         new_embedding = ReportEmbedding(incident_id=new_incident.id, embedding_vector=embedding)
         db.add(new_embedding)
+        db.commit()
+
+        event = RescueTimelineEvent(
+            incident_id=new_incident.id,
+            created_by=user_id,
+            event_type="SYSTEM",
+            title=f"Citizen submitted {payload.disaster_type} report",
+            is_system_generated=True,
+            created_at=datetime.utcnow()
+        )
+        db.add(event)
         db.commit()
 
         return new_report, {

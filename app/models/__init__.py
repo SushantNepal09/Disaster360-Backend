@@ -12,3 +12,4 @@ from .incident_assignment import IncidentAssignment
 from .sms_report import SmsReport
 from .status_history import StatusHistory
 from .rescue_live_update import RescueLiveUpdate
+from .rescue_timeline_event import RescueTimelineEvent

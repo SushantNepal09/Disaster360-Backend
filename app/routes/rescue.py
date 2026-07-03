@@ -15,6 +15,7 @@ from app.models.incident import Incident
 from app.models.incident_assignment import IncidentAssignment
 from app.models.report import Report
 from app.models.rescue_update import RescueUpdate
+from app.models.rescue_timeline_event import RescueTimelineEvent
 from app.models.user import User
 from app.routes.auth import get_current_rescue_team
 from app.services.notification_service import send_push_notification_task, NotificationType
@@ -38,6 +39,10 @@ class StatusUpdateRequest(BaseModel):
 class PostIncidentReportRequest(BaseModel):
     post_incident_report: str
 
+class TimelineEventCreateRequest(BaseModel):
+    title: str
+    description: Optional[str] = None
+    event_type: str = "MANUAL"
 
 # ======================
 # Live Situation Update Schema
@@ -704,5 +709,103 @@ def post_live_update(
         "message": "Live update posted successfully",
         "data": {
             "id": live_update.id
+        }
+    }
+
+
+# ======================
+# Timeline API (Phase 8)
+# ======================
+@router.get("/operations/{operation_id}/timeline")
+def get_timeline_events(
+    operation_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_rescue_team)
+):
+    # Verify active operation
+    assignment = db.query(IncidentAssignment).filter(
+        IncidentAssignment.incident_id == operation_id,
+        IncidentAssignment.team_id == current_user.id
+    ).first()
+    
+    if not assignment:
+        raise HTTPException(status_code=403, detail="Not assigned to this incident.")
+
+    events = db.query(RescueTimelineEvent).filter(
+        RescueTimelineEvent.incident_id == operation_id
+    ).order_by(RescueTimelineEvent.created_at.desc()).all()
+
+    result = []
+    for e in events:
+        team_name = None
+        if e.team_id:
+            team = db.query(User).filter(User.id == e.team_id).first()
+            if team:
+                team_name = team.full_name or team.email
+
+        result.append({
+            "id": e.id,
+            "incident_id": e.incident_id,
+            "assignment_id": e.assignment_id,
+            "team_id": str(e.team_id) if e.team_id else None,
+            "team_name": team_name,
+            "created_by": str(e.created_by) if e.created_by else None,
+            "event_type": e.event_type,
+            "title": e.title,
+            "description": e.description,
+            "created_at": e.created_at.isoformat() if e.created_at else None,
+            "metadata_json": e.metadata_json,
+            "is_system_generated": e.is_system_generated
+        })
+
+    return {
+        "success": True,
+        "data": result
+    }
+
+@router.post("/operations/{operation_id}/timeline")
+def create_manual_timeline_event(
+    operation_id: int,
+    payload: TimelineEventCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_rescue_team)
+):
+    # Verify active operation
+    assignment = db.query(IncidentAssignment).filter(
+        IncidentAssignment.incident_id == operation_id,
+        IncidentAssignment.team_id == current_user.id
+    ).first()
+    
+    if not assignment:
+        raise HTTPException(status_code=403, detail="Not assigned to this incident.")
+        
+    if assignment.status != AssignmentStatus.IN_PROGRESS:
+        raise HTTPException(
+            status_code=400, 
+            detail="Manual updates can only be posted while the operation is In Progress."
+        )
+
+    new_event = RescueTimelineEvent(
+        incident_id=operation_id,
+        assignment_id=assignment.id,
+        team_id=current_user.id,
+        created_by=current_user.id,
+        event_type=payload.event_type,
+        title=payload.title,
+        description=payload.description,
+        is_system_generated=False,
+        created_at=datetime.utcnow()
+    )
+    
+    db.add(new_event)
+    db.commit()
+    db.refresh(new_event)
+
+    return {
+        "success": True,
+        "message": "Timeline event added successfully.",
+        "data": {
+            "id": new_event.id,
+            "created_at": new_event.created_at.isoformat()
         }
     }
