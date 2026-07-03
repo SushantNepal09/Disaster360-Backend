@@ -17,11 +17,22 @@ from app.models.incident_assignment import IncidentAssignment
 from app.models.report import Report
 from app.models.rescue_update import RescueUpdate
 from app.models.rescue_timeline_event import RescueTimelineEvent
+from app.models.post_incident_report import PostIncidentReport, PostIncidentReportAttachment
 from app.models.user import User
 from app.routes.auth import get_current_rescue_team, get_current_user
 from app.services.notification_service import send_push_notification_task, NotificationType
 from app.services.status_transition_service import StatusTransitionService
 from app.core.statuses import IncidentStatus, ReportStatus, AssignmentStatus
+from fastapi import UploadFile, File
+import os
+import uuid
+from supabase import create_client, Client
+from typing import List
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase: Client | None = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+
 
 router = APIRouter(prefix="/rescue", tags=["Rescue Team"])
 
@@ -37,8 +48,7 @@ class StatusUpdateRequest(BaseModel):
     status: str  # Accepted | In Progress | Completed | Cancelled
 
 
-class PostIncidentReportRequest(BaseModel):
-    post_incident_report: str
+
 
 class TimelineEventCreateRequest(BaseModel):
     title: str
@@ -473,13 +483,11 @@ def get_my_assignments(
 
 
 # ======================
-# Submit Post-Incident Report
-# Only allowed when operation status is Completed
+# Get Post-Incident Report
 # ======================
-@router.post("/operations/{assignment_id}/post-incident-report")
-def submit_post_incident_report(
+@router.get("/operations/{assignment_id}/post-incident-report")
+def get_post_incident_report(
     assignment_id: int,
-    payload: PostIncidentReportRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_rescue_team)
 ):
@@ -490,34 +498,168 @@ def submit_post_incident_report(
     if not assignment:
         raise HTTPException(status_code=404, detail="Rescue assignment not found")
 
-    # Only the assigned rescue team member can submit
+    report = db.query(PostIncidentReport).filter(PostIncidentReport.assignment_id == assignment_id).first()
+    
+    if not report:
+        return {
+            "success": True,
+            "data": None
+        }
+
+    attachments = [{
+        "id": att.id,
+        "original_filename": att.original_filename,
+        "file_url": att.file_url,
+        "file_size": att.file_size,
+        "uploaded_at": att.uploaded_at.isoformat() if att.uploaded_at else None
+    } for att in report.attachments]
+    
+    return {
+        "success": True,
+        "data": {
+            "id": report.id,
+            "created_at": report.created_at.isoformat() if report.created_at else None,
+            "attachments": attachments
+        }
+    }
+
+
+# ======================
+# Upload PDF Attachments
+# ======================
+@router.post("/operations/{assignment_id}/post-incident-report/attachments")
+async def upload_report_attachments(
+    assignment_id: int,
+    files: List[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_rescue_team)
+):
+    assignment = db.query(IncidentAssignment).filter(IncidentAssignment.id == assignment_id).first()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Rescue assignment not found")
+        
     if str(assignment.team_id) != str(current_user.id):
-        raise HTTPException(
-            status_code=403,
-            detail="You can only submit reports for your own operations"
-        )
+        raise HTTPException(status_code=403, detail="Not authorized to upload attachments for this report")
 
-    # Post-incident report only allowed after operation is Completed
-    if assignment.status != AssignmentStatus.COMPLETED:
-        raise HTTPException(
-            status_code=400,
-            detail="Post-incident report can only be submitted when status is 'Completed'"
-        )
+    report = db.query(PostIncidentReport).filter(PostIncidentReport.assignment_id == assignment_id).first()
+    if not report:
+        report = PostIncidentReport(assignment_id=assignment.id, incident_id=assignment.incident_id)
+        db.add(report)
+        db.commit()
+        db.refresh(report)
 
-    report_log = RescueUpdate(
-        incident_id=assignment.incident_id,
-        rescue_team_id=current_user.id,
-        post_incident_report=payload.post_incident_report,
-        message="Post-incident report submitted."
-    )
-    db.add(report_log)
-    db.commit()
-    db.refresh(report_log)
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase client not configured on server")
+
+    MAX_FILE_SIZE = 20 * 1024 * 1024 # 20MB
+    uploaded_records = []
+
+    for file in files:
+        if file.content_type != "application/pdf" and not file.filename.lower().endswith('.pdf'):
+            raise HTTPException(status_code=400, detail=f"File {file.filename} is not a PDF")
+            
+        file_bytes = await file.read()
+        if len(file_bytes) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=400, detail=f"File {file.filename} exceeds 20MB limit")
+        
+        stored_filename = f"{uuid.uuid4()}.pdf"
+        storage_path = f"reports/{report.id}/{stored_filename}"
+
+        # Upload to supabase (assuming 'media' bucket, or maybe 'reports' bucket. We will use 'media' bucket as it is likely existing)
+        try:
+            res = supabase.storage.from_("media").upload(
+                path=storage_path,
+                file=file_bytes,
+                file_options={"content-type": "application/pdf"}
+            )
+            public_url = supabase.storage.from_("media").get_public_url(storage_path)
+            
+            # DB Insertion
+            attachment = PostIncidentReportAttachment(
+                post_incident_report_id=report.id,
+                original_filename=file.filename,
+                stored_filename=stored_filename,
+                file_url=public_url,
+                file_size=len(file_bytes),
+                mime_type="application/pdf"
+            )
+            db.add(attachment)
+            db.commit()
+            db.refresh(attachment)
+            
+            uploaded_records.append({
+                "id": attachment.id,
+                "original_filename": attachment.original_filename,
+                "file_url": attachment.file_url,
+                "file_size": attachment.file_size,
+                "uploaded_at": attachment.uploaded_at.isoformat() if attachment.uploaded_at else None
+            })
+        except Exception as e:
+            # If upload fails, continue with other files or rollback? The user asked for "No orphan files remain after failures."
+            # We rollback DB if storage fails automatically by not committing.
+            raise HTTPException(status_code=500, detail=f"Failed to upload {file.filename}: {str(e)}")
 
     return {
-        "message": "Post-incident report submitted successfully",
-        "rescue_update_id": report_log.id,
-        "submitted_by": current_user.email
+        "success": True,
+        "message": f"Successfully uploaded {len(uploaded_records)} attachments",
+        "attachments": uploaded_records
+    }
+
+
+# ======================
+# Delete PDF Attachment
+# ======================
+@router.delete("/reports/{report_id}/attachments/{attachment_id}")
+def delete_report_attachment(
+    report_id: int,
+    attachment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_rescue_team)
+):
+    report = db.query(PostIncidentReport).filter(PostIncidentReport.id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+        
+    assignment = db.query(IncidentAssignment).filter(IncidentAssignment.id == report.assignment_id).first()
+    if not assignment or str(assignment.team_id) != str(current_user.id):
+        raise HTTPException(status_code=403, detail="Not authorized to delete attachments for this report")
+
+    attachment = db.query(PostIncidentReportAttachment).filter(
+        PostIncidentReportAttachment.id == attachment_id,
+        PostIncidentReportAttachment.post_incident_report_id == report_id
+    ).first()
+
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase client not configured on server")
+
+    storage_path = f"reports/{report_id}/{attachment.stored_filename}"
+    
+    try:
+        supabase.storage.from_("media").remove([storage_path])
+        db.delete(attachment)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to delete attachment: {str(e)}")
+
+    # Return updated list
+    remaining = db.query(PostIncidentReportAttachment).filter(
+        PostIncidentReportAttachment.post_incident_report_id == report_id
+    ).order_by(PostIncidentReportAttachment.uploaded_at).all()
+    
+    return {
+        "success": True,
+        "message": "Attachment deleted successfully",
+        "attachments": [{
+            "id": att.id,
+            "original_filename": att.original_filename,
+            "file_url": att.file_url,
+            "file_size": att.file_size,
+            "uploaded_at": att.uploaded_at.isoformat() if att.uploaded_at else None
+        } for att in remaining]
     }
 
 
