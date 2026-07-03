@@ -69,18 +69,24 @@ class StatusTransitionService:
         StatusTransitionService._validate_transition('Incident', old_status, new_status, user_role)
         
         incident.status = new_status
-        # Handle side-effects if needed, e.g. closing reports if incident is rejected
-        if new_status == IncidentStatus.REJECTED:
-            # Also reject all pending/verified reports associated
-            reports = db.query(Report).filter(Report.incident_id == incident.id, Report.status.in_([ReportStatus.PENDING, ReportStatus.VERIFIED])).all()
-            for r in reports:
-                StatusTransitionService.change_report_status(db, r.id, ReportStatus.REJECTED, user_id, user_role, remarks="Auto-rejected because incident was rejected")
         
         # Admin Verified logic (mark as verified bool too)
         if new_status in [IncidentStatus.VERIFIED, IncidentStatus.ASSIGNED, IncidentStatus.IN_PROGRESS, IncidentStatus.CONTROLLED, IncidentStatus.CLOSED]:
             incident.verified = True
         elif new_status == IncidentStatus.PENDING:
             incident.verified = False
+
+        # Propagate status to ALL child reports (Rule A & D)
+        reports = db.query(Report).filter(Report.incident_id == incident.id).all()
+        for r in reports:
+            if r.status != new_status:
+                old_r_status = r.status
+                r.status = new_status
+                r.verified = incident.verified
+                StatusTransitionService._record_history(
+                    db, 'Report', r.id, old_r_status, new_status, user_id, 
+                    remarks=f"Inherited status from parent incident update: {remarks or ''}".strip()
+                )
 
         StatusTransitionService._record_history(db, 'Incident', incident_id, old_status, new_status, user_id, remarks)
         return incident
@@ -162,6 +168,24 @@ class StatusTransitionService:
             # Since this is an auto-sync, we bypass validation for internal state updates
             old_status = incident.status
             incident.status = new_derived_status
+            
+            if new_derived_status in [IncidentStatus.VERIFIED, IncidentStatus.ASSIGNED, IncidentStatus.IN_PROGRESS, IncidentStatus.CONTROLLED, IncidentStatus.CLOSED]:
+                incident.verified = True
+            elif new_derived_status == IncidentStatus.PENDING:
+                incident.verified = False
+                
+            # Propagate to children
+            reports = db.query(Report).filter(Report.incident_id == incident.id).all()
+            for r in reports:
+                if r.status != new_derived_status:
+                    old_r_status = r.status
+                    r.status = new_derived_status
+                    r.verified = incident.verified
+                    StatusTransitionService._record_history(
+                        db, 'Report', r.id, old_r_status, new_derived_status, user_id, 
+                        remarks="Auto-synced from assignment changes"
+                    )
+            
             StatusTransitionService._record_history(
                 db, 'Incident', incident.id, old_status, new_derived_status, user_id, 
                 remarks="Auto-synced from assignment changes"

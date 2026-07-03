@@ -6,8 +6,9 @@ from sqlalchemy.orm import Session, joinedload
 from pydantic import BaseModel
 from typing import List, Optional, Union
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 from app.database import get_db
+from app.core.config import settings
 from app.models.incident import Incident
 from app.models.report import Report
 from app.models.user import User
@@ -37,7 +38,7 @@ def get_embedding(text: str) -> list[float]:
     # Check if API key is missing from environment instead of checking the client object
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key or api_key == "dummy_key_for_local_development":
-        return [0.0] * 1536
+        return [0.0] * settings.DUPLICATE_DETECTION_EMBEDDING_DIMENSIONS
     
     try:
         # Initialize client inside the function so it picks up .env changes
@@ -54,8 +55,7 @@ def get_embedding(text: str) -> list[float]:
             raise ValueError("Google embedding API returned no embeddings")
         return result.embeddings[0].values
     except Exception as e:
-        # pass
-        return [0.0] * 1536
+        return [0.0] * settings.DUPLICATE_DETECTION_EMBEDDING_DIMENSIONS
 
 class ReportCreateRequest(BaseModel):
     disaster_type: str
@@ -122,8 +122,12 @@ def serialize_incident(inc, current_user_id=None, is_admin=False):
             "user_id": str(r.user_id), 
             "user_name": user_name, 
             "title": child_title,
+            "disaster_type": inc.disaster_type,
             "description": r.description,
             "severity": child_severity,
+            "location": r.location if getattr(r, 'location', None) else inc.location,
+            "latitude": r.latitude if getattr(r, 'latitude', None) else inc.latitude,
+            "longitude": r.longitude if getattr(r, 'longitude', None) else inc.longitude,
             "timestamp": ts,
             "status": r.status,
             "verified": getattr(r, 'verified', False),
@@ -190,16 +194,31 @@ def serialize_incident(inc, current_user_id=None, is_admin=False):
     }
 
 def process_disaster_report(payload: ReportCreateRequest, db: Session, user_id: str | None = None):
+    # Ensure title and description contain actual text
+    clean_title = (payload.title or "").strip()
+    clean_desc = (payload.description or "").strip()
+    
+    if not clean_title and not clean_desc:
+        raise HTTPException(status_code=400, detail="Cannot process report: Both title and description are empty.")
+        
+    embedding_text_parts = []
+    if clean_title:
+        embedding_text_parts.append(clean_title)
+    if clean_desc:
+        embedding_text_parts.append(clean_desc)
+    
+    embedding_text = ". ".join(embedding_text_parts)
+
     # Ensure location is a string for the database
     loc_val = payload.location
     if isinstance(loc_val, list):
         loc_val = ", ".join(str(x) for x in loc_val)
 
-    DISASTER_RADIUS_KM = {"flood": 5.0, "landslide": 3.0, "earthquake": 50.0, "fire": 2.0, "default": 5.0}
-    TEXT_THRESHOLD = 0.75
+    RADIUS_KM = settings.get_radius(payload.disaster_type)
+    TEXT_THRESHOLD = settings.DUPLICATE_DETECTION_SIMILARITY_THRESHOLD
+    time_window = timedelta(hours=settings.DUPLICATE_DETECTION_TIME_WINDOW_HOURS)
 
-    RADIUS_KM = DISASTER_RADIUS_KM.get(payload.disaster_type.lower(), DISASTER_RADIUS_KM["default"])
-    embedding = get_embedding(f"{payload.title}. {payload.description}")
+    embedding = get_embedding(embedding_text)
 
     parsed_timestamp = datetime.utcnow()
     if payload.created_at:
@@ -208,35 +227,51 @@ def process_disaster_report(payload: ReportCreateRequest, db: Session, user_id: 
         except ValueError:
             pass
 
-    same_type_incidents = db.query(Incident).filter(Incident.disaster_type.ilike(payload.disaster_type)).all()
+    cutoff_time = datetime.utcnow() - time_window
+
+    same_type_incidents = db.query(Incident).filter(
+        Incident.disaster_type.ilike(payload.disaster_type),
+        Incident.created_at >= cutoff_time,
+        Incident.status.notin_(["Verified and Closed", "Resolved", "Rejected"])
+    ).all()
+    
     nearby_incident_ids = []
-    nearby_distances = {}
 
     for inc in same_type_incidents:
-        if inc.latitude is None or inc.longitude is None: continue
-        distance_km = calculate_distance(payload.latitude, payload.longitude, inc.latitude, inc.longitude)
-        if distance_km <= RADIUS_KM:
+        is_nearby = False
+        if inc.latitude is not None and inc.longitude is not None:
+            if calculate_distance(payload.latitude, payload.longitude, inc.latitude, inc.longitude) <= RADIUS_KM:
+                is_nearby = True
+                
+        if not is_nearby:
+            for r in inc.reports:
+                if r.latitude is not None and r.longitude is not None:
+                    if calculate_distance(payload.latitude, payload.longitude, r.latitude, r.longitude) <= RADIUS_KM:
+                        is_nearby = True
+                        break
+                        
+        if is_nearby:
             nearby_incident_ids.append(inc.id)
-            nearby_distances[inc.id] = round(distance_km, 2)
-
-    closest = None
-    if nearby_incident_ids:
-        closest = (
-            db.query(ReportEmbedding, (1 - ReportEmbedding.embedding_vector.cosine_distance(embedding)).label("similarity"))
-            .filter(ReportEmbedding.embedding_vector.isnot(None))
-            .filter(ReportEmbedding.incident_id.in_(nearby_incident_ids))
-            .order_by(ReportEmbedding.embedding_vector.cosine_distance(embedding))
-            .first()
-        )
 
     matched_incident = None
     similarity_score = 0.0
 
-    if closest is not None:
-        emb_row, sim = closest
-        similarity_score = float(sim)
-        if similarity_score >= TEXT_THRESHOLD:
-            matched_incident = db.query(Incident).filter(Incident.id == emb_row.incident_id).first()
+    if nearby_incident_ids:
+        candidates = (
+            db.query(ReportEmbedding, Incident, (1 - ReportEmbedding.embedding_vector.cosine_distance(embedding)).label("similarity"))
+            .join(Incident, ReportEmbedding.incident_id == Incident.id)
+            .filter(ReportEmbedding.embedding_vector.isnot(None))
+            .filter(ReportEmbedding.incident_id.in_(nearby_incident_ids))
+            .all()
+        )
+        
+        valid_candidates = [c for c in candidates if float(c.similarity) >= TEXT_THRESHOLD]
+        if valid_candidates:
+            # Earliest incident selection
+            valid_candidates.sort(key=lambda x: x[1].created_at)
+            best_match = valid_candidates[0]
+            matched_incident = best_match[1]
+            similarity_score = float(best_match.similarity)
 
     if matched_incident:
         matched_incident.sources = (matched_incident.sources or 1) + 1 # type: ignore
@@ -248,7 +283,10 @@ def process_disaster_report(payload: ReportCreateRequest, db: Session, user_id: 
             user_id=user_id, 
             title=payload.title,
             severity=payload.severity,
-            description=payload.description, 
+            description=payload.description,
+            location=loc_val,
+            latitude=payload.latitude,
+            longitude=payload.longitude,
             timestamp=parsed_timestamp,
             status=matched_incident.status,
             verified=getattr(matched_incident, 'verified', False)
@@ -257,8 +295,6 @@ def process_disaster_report(payload: ReportCreateRequest, db: Session, user_id: 
         db.commit()
         db.refresh(new_report)
 
-        distance_km = nearby_distances.get(matched_incident.id, 0.0)
-
         return new_report, {
             "message": "Your report matched an existing incident and has been merged.",
             "merged": True,
@@ -266,7 +302,6 @@ def process_disaster_report(payload: ReportCreateRequest, db: Session, user_id: 
             "submission_id": new_report.id,
             "disaster_type": payload.disaster_type,
             "similarity_score": round(similarity_score, 4),
-            "distance_km": distance_km,
             "radius_used_km": RADIUS_KM,
             "sources": matched_incident.sources
         }
@@ -286,6 +321,9 @@ def process_disaster_report(payload: ReportCreateRequest, db: Session, user_id: 
             title=payload.title,
             severity=payload.severity,
             description=payload.description, 
+            location=loc_val,
+            latitude=payload.latitude,
+            longitude=payload.longitude,
             timestamp=parsed_timestamp
         )
         db.add(new_report)

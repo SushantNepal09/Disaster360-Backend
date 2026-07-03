@@ -23,6 +23,11 @@ class Report(Base):
     severity = Column(String, nullable=True)
     description = Column(Text)
     
+    # User's specific location
+    location = Column(String, nullable=True)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    
     # Store images (you could also use report_media but storing one per report is simple)
     image = Column(String, nullable=True) 
     
