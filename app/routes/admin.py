@@ -309,7 +309,8 @@ def admin_assign_team(
                 incident_id=incident.id, 
                 team_name=u.full_name or u.email, 
                 team_id=u.id,
-                status=AssignmentStatus.ASSIGNED
+                status=AssignmentStatus.ASSIGNED,
+                assigned_by_id=current_user.id
             )
             db.add(new_assign)
             db.flush()
@@ -733,38 +734,9 @@ def get_incident_history(
     db: Session = Depends(get_db),
     current_admin: User = Depends(get_current_admin)
 ):
-    # pyrefly: ignore [missing-import]
-    from app.models.status_history import StatusHistory
+    from app.services.timeline_service import TimelineService
     
-    # We want history of the Incident itself, and any Assignments belonging to this Incident.
-    assignments = db.query(IncidentAssignment).filter(IncidentAssignment.incident_id == incident_id).all()
-    assignment_ids = [a.id for a in assignments]
-
-    # Query StatusHistory
-    history_records = db.query(StatusHistory).filter(
-        ((StatusHistory.entity_type == "Incident") & (StatusHistory.entity_id == incident_id)) |
-        ((StatusHistory.entity_type == "Assignment") & (StatusHistory.entity_id.in_(assignment_ids)))
-    ).order_by(StatusHistory.timestamp.desc()).all()
-
-    data = []
-    for h in history_records:
-        role = "System"
-        if h.changed_by:
-            user = db.query(User).filter(User.id == h.changed_by).first()
-            if user:
-                role = user.role.value if hasattr(user.role, 'value') else str(user.role)
-        
-        data.append({
-            "id": h.id,
-            "entity_type": h.entity_type,
-            "entity_id": h.entity_id,
-            "old_status": h.old_status,
-            "new_status": h.new_status,
-            "changed_by": str(h.changed_by) if h.changed_by else None,
-            "changed_by_role": role,
-            "remarks": h.remarks,
-            "created_at": h.timestamp.isoformat() if h.timestamp else None
-        })
+    data = TimelineService.build_incident_timeline(db, incident_id)
 
     return {
         "success": True,

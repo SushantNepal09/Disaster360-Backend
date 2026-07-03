@@ -40,6 +40,20 @@ class PostIncidentReportRequest(BaseModel):
 
 
 # ======================
+# Live Situation Update Schema
+# ======================
+class LiveUpdateCreateRequest(BaseModel):
+    category: str
+    severity: str
+    message: str
+    media_url: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    visibility: str = "Public"
+    device_time: Optional[datetime] = None
+
+
+# ======================
 # Get Rescue Team Profile + Stats
 # ======================
 @router.get("/profile")
@@ -87,8 +101,13 @@ def get_all_reports(
     data = []
     for r in reports:
         reporter_name = "Unknown Reporter"
-        if r.reports and len(r.reports) > 0 and r.reports[0].user:
-            reporter_name = r.reports[0].user.full_name or r.reports[0].user.email or "Unknown Reporter"
+        if r.reports and len(r.reports) > 0:
+            # Sort reports by timestamp to ensure we get the earliest (primary) reporter
+            sorted_reports = sorted(r.reports, key=lambda rep: getattr(rep, 'timestamp', None) or datetime.max)
+            if sorted_reports[0].user:
+                reporter_name = sorted_reports[0].user.full_name or sorted_reports[0].user.email or "Unknown Reporter"
+
+        team_assignment = next((a for a in r.assignments if a.team_id == current_user.id), None)
 
         data.append({
             "incidentId": str(r.id),
@@ -115,6 +134,7 @@ def get_all_reports(
                     "url": m.file_path
                 } for m in r.media
             ] if hasattr(r, "media") and r.media else [],
+            "sources": r.sources or 1,
             "actions": {
                 "canAcknowledge": bool(team_assignment and team_assignment.status == "Assigned"),
                 "canUpdateStatus": bool(team_assignment and team_assignment.status == "Accepted"),
@@ -377,8 +397,11 @@ def get_my_assignments(
         can_submit_report = a.status == AssignmentStatus.COMPLETED and (not rescue_update or not rescue_update.post_incident_report)
 
         reporter_name = "Unknown Reporter"
-        if incident.reports and len(incident.reports) > 0 and incident.reports[0].user:
-            reporter_name = incident.reports[0].user.full_name or incident.reports[0].user.email or "Unknown Reporter"
+        if incident.reports and len(incident.reports) > 0:
+            # Sort reports by timestamp to ensure we get the earliest (primary) reporter
+            sorted_reports = sorted(incident.reports, key=lambda rep: getattr(rep, 'timestamp', None) or datetime.max)
+            if sorted_reports[0].user:
+                reporter_name = sorted_reports[0].user.full_name or sorted_reports[0].user.email or "Unknown Reporter"
 
         data.append({
             "assignmentId": str(a.id),
@@ -395,6 +418,8 @@ def get_my_assignments(
             "status": a.status,
             "verificationStatus": "Verified",
             "assignedAt": a.assigned_at.isoformat() if a.assigned_at else None,
+            "acceptedAt": a.accepted_at.isoformat() if a.accepted_at else None,
+            "assignedBy": a.assigned_by.full_name or a.assigned_by.email if a.assigned_by else "System",
             "reportedAt": incident.created_at.isoformat() if incident.created_at else None,
             "location": {
                 "address": incident.location,
@@ -408,6 +433,7 @@ def get_my_assignments(
                     "url": m.file_path
                 } for m in incident.media
             ] if hasattr(incident, "media") and incident.media else [],
+            "sources": incident.sources or 1,
             "rescueTeam": {
                 "id": str(current_user.id),
                 "name": current_user.full_name or current_user.email
@@ -603,4 +629,80 @@ def get_completed_assignments(
         "success": True,
         "message": "Completed tasks fetched successfully",
         "data": data
+    }
+
+
+# ======================
+# Post Live Situation Update
+# ======================
+@router.post("/incidents/{incident_id}/live-updates")
+def post_live_update(
+    incident_id: int,
+    payload: LiveUpdateCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_rescue_team)
+):
+    from app.models.rescue_live_update import RescueLiveUpdate
+    from app.models.incident_assignment import IncidentAssignment
+    
+    # 1. Ensure team is assigned and status is In Progress
+    assignment = db.query(IncidentAssignment).filter(
+        IncidentAssignment.incident_id == incident_id,
+        IncidentAssignment.team_id == current_user.id
+    ).first()
+    
+    if not assignment:
+        raise HTTPException(status_code=403, detail="Not assigned to this incident.")
+        
+    if assignment.status != AssignmentStatus.IN_PROGRESS:
+        raise HTTPException(
+            status_code=400, 
+            detail="Live updates can only be posted while the operation is In Progress."
+        )
+        
+    # 2. Rate Limiting Check
+    last_update = db.query(RescueLiveUpdate).filter(
+        RescueLiveUpdate.assignment_id == assignment.id
+    ).order_by(RescueLiveUpdate.created_at.desc()).first()
+    
+    if last_update:
+        time_since_last = (datetime.utcnow() - last_update.created_at).total_seconds()
+        if time_since_last < 10:
+            raise HTTPException(status_code=429, detail="Please wait before posting another update.")
+            
+    # 3. Create Update
+    live_update = RescueLiveUpdate(
+        incident_id=incident_id,
+        assignment_id=assignment.id,
+        team_id=current_user.id,
+        team_name=current_user.full_name or current_user.email or "Rescue Team",
+        category=payload.category,
+        severity=payload.severity,
+        message=payload.message,
+        media_url=payload.media_url,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        visibility=payload.visibility,
+        device_time=payload.device_time
+    )
+    
+    db.add(live_update)
+    db.commit()
+    db.refresh(live_update)
+    
+    # Trigger notifications using existing task
+    send_push_notification_task(
+        db,
+        title="Live Rescue Update",
+        body=f"[{payload.category}] {payload.message}",
+        data={"incident_id": str(incident_id), "type": "LIVE_UPDATE"},
+        notification_type=NotificationType.DISASTER_UPDATE
+    )
+    
+    return {
+        "success": True,
+        "message": "Live update posted successfully",
+        "data": {
+            "id": live_update.id
+        }
     }

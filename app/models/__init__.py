@@ -11,3 +11,4 @@ from .report_reaction import ReportReaction
 from .incident_assignment import IncidentAssignment
 from .sms_report import SmsReport
 from .status_history import StatusHistory
+from .rescue_live_update import RescueLiveUpdate

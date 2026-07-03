@@ -1,4 +1,5 @@
 from sqlalchemy.orm import Session
+from datetime import datetime
 # pyrefly: ignore [missing-import]
 from fastapi import HTTPException
 from app.models.incident import Incident
@@ -115,6 +116,9 @@ class StatusTransitionService:
         StatusTransitionService._validate_transition('Assignment', old_status, new_status, user_role)
         
         assignment.status = new_status
+        if new_status == AssignmentStatus.ACCEPTED and assignment.accepted_at is None:
+            assignment.accepted_at = datetime.utcnow()
+            
         StatusTransitionService._record_history(db, 'Assignment', assignment_id, old_status, new_status, user_id, remarks)
         
         # After saving assignment, flush and check if parent incident needs auto-updating

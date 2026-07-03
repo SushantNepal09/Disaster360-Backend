@@ -568,3 +568,45 @@ def react_to_submission(
             break
 
     return {"likes": likes, "dislikes": dislikes, "user_reaction": user_new_reaction}
+
+
+# ======================
+# Get Unified Incident Timeline
+# ======================
+@router.get("/incidents/{incident_id}/timeline")
+def get_incident_timeline(
+    incident_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_optional_current_user)
+):
+    """
+    Returns the chronologically ordered timeline for a specific incident,
+    merging StatusHistory and RescueLiveUpdates.
+    """
+    from app.services.timeline_service import TimelineService
+    from app.models.incident import Incident
+    
+    incident = db.query(Incident).filter(Incident.id == incident_id).first()
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+        
+    timeline_data = TimelineService.build_incident_timeline(db, incident_id)
+    
+    # Role-based filtering / serialization
+    is_admin = False
+    if current_user and str(getattr(current_user, 'role', '')).lower() == 'admin':
+        is_admin = True
+        
+    filtered_timeline = []
+    for item in timeline_data:
+        if item["type"] == "LiveUpdate":
+            # If ADMIN_ONLY, exclude from citizens
+            if item.get("visibility") == "Admin Only" and not is_admin:
+                continue
+                
+        filtered_timeline.append(item)
+        
+    return {
+        "success": True,
+        "data": filtered_timeline
+    }
