@@ -17,7 +17,7 @@ from app.models.report import Report
 from app.models.rescue_update import RescueUpdate
 from app.models.rescue_timeline_event import RescueTimelineEvent
 from app.models.user import User
-from app.routes.auth import get_current_rescue_team
+from app.routes.auth import get_current_rescue_team, get_current_user
 from app.services.notification_service import send_push_notification_task, NotificationType
 from app.services.status_transition_service import StatusTransitionService
 from app.core.statuses import IncidentStatus, ReportStatus, AssignmentStatus
@@ -43,6 +43,9 @@ class TimelineEventCreateRequest(BaseModel):
     title: str
     description: Optional[str] = None
     event_type: str = "MANUAL"
+
+class TimelineEventUpdateRequest(BaseModel):
+    description: str
 
 # ======================
 # Live Situation Update Schema
@@ -755,7 +758,10 @@ def get_timeline_events(
             "description": e.description,
             "created_at": e.created_at.isoformat() if e.created_at else None,
             "metadata_json": e.metadata_json,
-            "is_system_generated": e.is_system_generated
+            "is_system_generated": e.is_system_generated,
+            "updated_at": e.updated_at.isoformat() if e.updated_at else None,
+            "updated_by": str(e.updated_by) if e.updated_by else None,
+            "is_edited": e.is_edited
         })
 
     return {
@@ -809,3 +815,101 @@ def create_manual_timeline_event(
             "created_at": new_event.created_at.isoformat()
         }
     }
+
+
+@router.put("/operations/timeline/{timeline_event_id}")
+def update_timeline_event(
+    timeline_event_id: int,
+    payload: TimelineEventUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role not in ["rescue", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized to access timeline.")
+        
+    event = db.query(RescueTimelineEvent).filter(RescueTimelineEvent.id == timeline_event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Timeline event not found.")
+
+    if current_user.role != "admin" and str(event.created_by) != str(current_user.id):
+        raise HTTPException(status_code=403, detail="Not authorized to edit this timeline event.")
+
+    new_description = payload.description.strip()
+    if not new_description:
+        raise HTTPException(status_code=400, detail="Description cannot be empty.")
+
+    team_name = None
+    if event.team_id:
+        team = db.query(User).filter(User.id == event.team_id).first()
+        if team:
+            team_name = team.full_name or team.email
+
+    current_description = (event.description or "").strip()
+    if new_description == current_description:
+        return {
+            "id": event.id,
+            "incident_id": event.incident_id,
+            "assignment_id": event.assignment_id,
+            "team_id": str(event.team_id) if event.team_id else None,
+            "team_name": team_name,
+            "created_by": str(event.created_by) if event.created_by else None,
+            "event_type": event.event_type,
+            "title": event.title,
+            "description": event.description,
+            "created_at": event.created_at.isoformat() if event.created_at else None,
+            "metadata_json": event.metadata_json,
+            "is_system_generated": event.is_system_generated,
+            "updated_at": event.updated_at.isoformat() if event.updated_at else None,
+            "updated_by": str(event.updated_by) if event.updated_by else None,
+            "is_edited": event.is_edited
+        }
+
+    event.description = new_description
+    event.updated_at = datetime.utcnow()
+    event.updated_by = current_user.id
+    event.is_edited = True
+
+    db.commit()
+    db.refresh(event)
+
+    return {
+        "id": event.id,
+        "incident_id": event.incident_id,
+        "assignment_id": event.assignment_id,
+        "team_id": str(event.team_id) if event.team_id else None,
+        "team_name": team_name,
+        "created_by": str(event.created_by) if event.created_by else None,
+        "event_type": event.event_type,
+        "title": event.title,
+        "description": event.description,
+        "created_at": event.created_at.isoformat() if event.created_at else None,
+        "metadata_json": event.metadata_json,
+        "is_system_generated": event.is_system_generated,
+        "updated_at": event.updated_at.isoformat() if event.updated_at else None,
+        "updated_by": str(event.updated_by) if event.updated_by else None,
+        "is_edited": event.is_edited
+    }
+
+
+@router.delete("/operations/timeline/{timeline_event_id}")
+def delete_timeline_event(
+    timeline_event_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    from fastapi.responses import Response
+    
+    if current_user.role not in ["rescue", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized to access timeline.")
+        
+    event = db.query(RescueTimelineEvent).filter(RescueTimelineEvent.id == timeline_event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Timeline event not found.")
+
+    if current_user.role != "admin" and str(event.created_by) != str(current_user.id):
+        raise HTTPException(status_code=403, detail="Not authorized to delete this timeline event.")
+
+    db.delete(event)
+    db.commit()
+
+    return Response(status_code=204)

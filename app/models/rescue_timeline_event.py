@@ -19,6 +19,10 @@ class RescueTimelineEvent(Base):
     description = Column(Text, nullable=True)
     
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=True)
+    updated_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    is_edited = Column(Boolean, default=False)
+    
     metadata_json = Column(JSON, nullable=True)
     
     is_system_generated = Column(Boolean, default=False)
