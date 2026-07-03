@@ -1,5 +1,6 @@
 
 # pyrefly: ignore [missing-import]
+from app.models.report_media import ReportMedia
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 
 # pyrefly: ignore [missing-import]
@@ -60,6 +61,17 @@ class LiveUpdateCreateRequest(BaseModel):
     visibility: str = "Public"
     device_time: Optional[datetime] = None
 
+# ======================
+# Operation Media Schema
+# ======================
+class OperationMediaItem(BaseModel):
+    url: str
+    filename: Optional[str] = None
+    size: Optional[int] = None
+    title: Optional[str] = None
+
+class OperationMediaCreateRequest(BaseModel):
+    media: List[OperationMediaItem]
 
 # ======================
 # Get Rescue Team Profile + Stats
@@ -738,6 +750,12 @@ def get_timeline_events(
         RescueTimelineEvent.incident_id == operation_id
     ).order_by(RescueTimelineEvent.created_at.desc()).all()
 
+    media_ids = [e.media_id for e in events if e.media_id is not None]
+    media_dict = {}
+    if media_ids:
+        media_records = db.query(ReportMedia).filter(ReportMedia.id.in_(media_ids)).all()
+        media_dict = {m.id: m for m in media_records}
+
     result = []
     for e in events:
         team_name = None
@@ -745,6 +763,13 @@ def get_timeline_events(
             team = db.query(User).filter(User.id == e.team_id).first()
             if team:
                 team_name = team.full_name or team.email
+
+        display_title = e.title
+        if e.event_type == "MEDIA_UPLOADED" and e.media_id:
+            m = media_dict.get(e.media_id)
+            if m:
+                actual_title = m.title if m.title else f"Image {e.media_id}"
+                display_title = f"📷 {actual_title} (Image)"
 
         result.append({
             "id": e.id,
@@ -754,8 +779,9 @@ def get_timeline_events(
             "team_name": team_name,
             "created_by": str(e.created_by) if e.created_by else None,
             "event_type": e.event_type,
-            "title": e.title,
+            "title": display_title,
             "description": e.description,
+            "media_id": e.media_id,
             "created_at": e.created_at.isoformat() if e.created_at else None,
             "metadata_json": e.metadata_json,
             "is_system_generated": e.is_system_generated,
@@ -913,3 +939,94 @@ def delete_timeline_event(
     db.commit()
 
     return Response(status_code=204)
+
+@router.post("/operations/{operation_id}/media")
+def upload_operation_media(
+    operation_id: int,
+    payload: OperationMediaCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_rescue_team)
+):
+    assignment = db.query(IncidentAssignment).filter(
+        IncidentAssignment.incident_id == operation_id,
+        IncidentAssignment.team_id == current_user.id
+    ).first()
+    
+    if not assignment:
+        raise HTTPException(status_code=403, detail="Not assigned to this incident.")
+        
+    created_media = []
+    
+    for item in payload.media:
+        new_media = ReportMedia(
+            user_id=current_user.id,
+            incident_id=operation_id,
+            assignment_id=assignment.id,
+            file_path=item.url,
+            file_type="image",
+            original_filename=item.filename,
+            title=item.title,
+            file_size=item.size,
+            created_at=datetime.utcnow()
+        )
+        db.add(new_media)
+        db.flush()
+        
+        # Automatically generate timeline event
+        new_event = RescueTimelineEvent(
+            incident_id=operation_id,
+            assignment_id=assignment.id,
+            team_id=current_user.id,
+            created_by=current_user.id,
+            event_type="MEDIA_UPLOADED",
+            title=item.title if item.title else "Image Uploaded",
+            description=None,
+            media_id=new_media.id,
+            is_system_generated=True,
+            created_at=datetime.utcnow()
+        )
+        db.add(new_event)
+        
+        created_media.append(new_media)
+        
+    db.commit()
+    
+    return {
+        "success": True,
+        "message": f"Successfully attached {len(payload.media)} media files.",
+        "data": [{"id": m.id, "url": m.file_path} for m in created_media]
+    }
+
+
+@router.get("/operations/{operation_id}/media")
+def get_operation_media(
+    operation_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role not in ["rescue", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized.")
+        
+    media_files = db.query(ReportMedia).filter(
+        ReportMedia.incident_id == operation_id,
+        ReportMedia.assignment_id != None
+    ).order_by(ReportMedia.created_at.asc()).all()
+    
+    result = []
+    for m in media_files:
+        result.append({
+            "id": m.id,
+            "incident_id": m.incident_id,
+            "assignment_id": m.assignment_id,
+            "user_id": str(m.user_id),
+            "file_path": m.file_path,
+            "original_filename": m.original_filename,
+            "title": m.title,
+            "file_size": m.file_size,
+            "created_at": m.created_at.isoformat() if m.created_at else None
+        })
+        
+    return {
+        "success": True,
+        "data": result
+    }

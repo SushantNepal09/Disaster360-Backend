@@ -13,6 +13,7 @@ class RescueTimelineEvent(Base):
     team_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
     
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    media_id = Column(Integer, ForeignKey("report_media.id", ondelete="CASCADE"), nullable=True)
     
     event_type = Column(String, nullable=False) # e.g., 'SYSTEM', 'MANUAL'
     title = Column(String, nullable=False)
