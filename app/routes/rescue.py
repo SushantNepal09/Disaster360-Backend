@@ -595,6 +595,8 @@ async def upload_report_attachments(
                 "uploaded_at": attachment.uploaded_at.isoformat() if attachment.uploaded_at else None
             })
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             # If upload fails, continue with other files or rollback? The user asked for "No orphan files remain after failures."
             # We rollback DB if storage fails automatically by not committing.
             raise HTTPException(status_code=500, detail=f"Failed to upload {file.filename}: {str(e)}")
