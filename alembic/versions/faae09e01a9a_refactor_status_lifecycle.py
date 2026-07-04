@@ -39,10 +39,15 @@ def upgrade() -> None:
         op.create_index(op.f('ix_status_history_entity_id'), 'status_history', ['entity_id'], unique=False)
         op.create_index(op.f('ix_status_history_entity_type'), 'status_history', ['entity_type'], unique=False)
         op.create_index(op.f('ix_status_history_id'), 'status_history', ['id'], unique=False)
-    op.add_column('rescue_updates', sa.Column('message', sa.Text(), nullable=True))
-    op.add_column('rescue_updates', sa.Column('image_url', sa.String(), nullable=True))
-    op.add_column('rescue_updates', sa.Column('location_lat', sa.String(), nullable=True))
-    op.add_column('rescue_updates', sa.Column('location_lng', sa.String(), nullable=True))
+    columns = [col['name'] for col in inspector.get_columns('rescue_updates')]
+    if 'message' not in columns:
+        op.add_column('rescue_updates', sa.Column('message', sa.Text(), nullable=True))
+    if 'image_url' not in columns:
+        op.add_column('rescue_updates', sa.Column('image_url', sa.String(), nullable=True))
+    if 'location_lat' not in columns:
+        op.add_column('rescue_updates', sa.Column('location_lat', sa.String(), nullable=True))
+    if 'location_lng' not in columns:
+        op.add_column('rescue_updates', sa.Column('location_lng', sa.String(), nullable=True))
     
     # --- Data Migration Start ---
     # Map Incident Statuses
@@ -51,40 +56,48 @@ def upgrade() -> None:
     op.execute("UPDATE incidents SET status = 'Closed' WHERE status = 'Verified and Closed'")
     
     # Map RescueUpdate statuses to IncidentAssignments before dropping the column
-    op.execute("""
-        UPDATE incident_assignments 
-        SET status = 'Accepted'
-        FROM rescue_updates 
-        WHERE rescue_updates.incident_id = incident_assignments.incident_id 
-        AND rescue_updates.rescue_team_id = incident_assignments.team_id 
-        AND rescue_updates.status = 'acknowledged' 
-        AND incident_assignments.status = 'Assigned'
-    """)
-    op.execute("""
-        UPDATE incident_assignments 
-        SET status = 'In Progress'
-        FROM rescue_updates 
-        WHERE rescue_updates.incident_id = incident_assignments.incident_id 
-        AND rescue_updates.rescue_team_id = incident_assignments.team_id 
-        AND rescue_updates.status = 'in_progress'
-    """)
-    op.execute("""
-        UPDATE incident_assignments 
-        SET status = 'Completed'
-        FROM rescue_updates 
-        WHERE rescue_updates.incident_id = incident_assignments.incident_id 
-        AND rescue_updates.rescue_team_id = incident_assignments.team_id 
-        AND rescue_updates.status = 'resolved'
-    """)
+    if 'status' in columns:
+        op.execute("""
+            UPDATE incident_assignments 
+            SET status = 'Accepted'
+            FROM rescue_updates 
+            WHERE rescue_updates.incident_id = incident_assignments.incident_id 
+            AND rescue_updates.rescue_team_id = incident_assignments.team_id 
+            AND rescue_updates.status = 'acknowledged' 
+            AND incident_assignments.status = 'Assigned'
+        """)
+        op.execute("""
+            UPDATE incident_assignments 
+            SET status = 'In Progress'
+            FROM rescue_updates 
+            WHERE rescue_updates.incident_id = incident_assignments.incident_id 
+            AND rescue_updates.rescue_team_id = incident_assignments.team_id 
+            AND rescue_updates.status = 'in_progress'
+        """)
+        op.execute("""
+            UPDATE incident_assignments 
+            SET status = 'Completed'
+            FROM rescue_updates 
+            WHERE rescue_updates.incident_id = incident_assignments.incident_id 
+            AND rescue_updates.rescue_team_id = incident_assignments.team_id 
+            AND rescue_updates.status = 'resolved'
+        """)
     # --- Data Migration End ---
 
-    op.drop_column('rescue_updates', 'acknowledged_at')
-    op.drop_column('rescue_updates', 'in_progress_at')
-    op.drop_column('rescue_updates', 'status')
-    op.drop_column('rescue_updates', 'post_incident_submitted_at')
-    op.drop_column('rescue_updates', 'is_acknowledged')
-    op.drop_column('rescue_updates', 'resolved_at')
-    op.drop_column('rescue_updates', 'updated_at')
+    if 'acknowledged_at' in columns:
+        op.drop_column('rescue_updates', 'acknowledged_at')
+    if 'in_progress_at' in columns:
+        op.drop_column('rescue_updates', 'in_progress_at')
+    if 'status' in columns:
+        op.drop_column('rescue_updates', 'status')
+    if 'post_incident_submitted_at' in columns:
+        op.drop_column('rescue_updates', 'post_incident_submitted_at')
+    if 'is_acknowledged' in columns:
+        op.drop_column('rescue_updates', 'is_acknowledged')
+    if 'resolved_at' in columns:
+        op.drop_column('rescue_updates', 'resolved_at')
+    if 'updated_at' in columns:
+        op.drop_column('rescue_updates', 'updated_at')
     # ### end Alembic commands ###
 
 
