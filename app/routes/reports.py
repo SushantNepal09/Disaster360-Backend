@@ -13,6 +13,7 @@ from app.models.report import Report
 from app.models.user import User
 from app.routes.auth import get_current_user, get_optional_current_user
 from app.models.report_embedding import ReportEmbedding
+from app.models.rescue_timeline_event import RescueTimelineEvent
 from app.models.rescue_update import RescueUpdate
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import object_session
@@ -256,6 +257,17 @@ def process_disaster_report(payload: ReportCreateRequest, db: Session, user_id: 
         db.add(new_report)
         db.commit()
         db.refresh(new_report)
+        
+        event = RescueTimelineEvent(
+            incident_id=matched_incident.id,
+            created_by=user_id,
+            event_type="SYSTEM",
+            title=f"Citizen submitted {payload.disaster_type} report",
+            is_system_generated=True,
+            created_at=datetime.utcnow()
+        )
+        db.add(event)
+        db.commit()
 
         distance_km = nearby_distances.get(matched_incident.id, 0.0)
 
@@ -294,6 +306,17 @@ def process_disaster_report(payload: ReportCreateRequest, db: Session, user_id: 
 
         new_embedding = ReportEmbedding(incident_id=new_incident.id, embedding_vector=embedding)
         db.add(new_embedding)
+        db.commit()
+
+        event = RescueTimelineEvent(
+            incident_id=new_incident.id,
+            created_by=user_id,
+            event_type="SYSTEM",
+            title=f"Citizen submitted {payload.disaster_type} report",
+            is_system_generated=True,
+            created_at=datetime.utcnow()
+        )
+        db.add(event)
         db.commit()
 
         return new_report, {
@@ -568,3 +591,45 @@ def react_to_submission(
             break
 
     return {"likes": likes, "dislikes": dislikes, "user_reaction": user_new_reaction}
+
+
+# ======================
+# Get Unified Incident Timeline
+# ======================
+@router.get("/incidents/{incident_id}/timeline")
+def get_incident_timeline(
+    incident_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_optional_current_user)
+):
+    """
+    Returns the chronologically ordered timeline for a specific incident,
+    merging StatusHistory and RescueLiveUpdates.
+    """
+    from app.services.timeline_service import TimelineService
+    from app.models.incident import Incident
+    
+    incident = db.query(Incident).filter(Incident.id == incident_id).first()
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+        
+    timeline_data = TimelineService.build_incident_timeline(db, incident_id)
+    
+    # Role-based filtering / serialization
+    is_admin = False
+    if current_user and str(getattr(current_user, 'role', '')).lower() == 'admin':
+        is_admin = True
+        
+    filtered_timeline = []
+    for item in timeline_data:
+        if item["type"] == "LiveUpdate":
+            # If ADMIN_ONLY, exclude from citizens
+            if item.get("visibility") == "Admin Only" and not is_admin:
+                continue
+                
+        filtered_timeline.append(item)
+        
+    return {
+        "success": True,
+        "data": filtered_timeline
+    }

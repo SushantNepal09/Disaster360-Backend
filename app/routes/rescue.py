@@ -1,5 +1,6 @@
 
 # pyrefly: ignore [missing-import]
+from app.models.report_media import ReportMedia
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 
 # pyrefly: ignore [missing-import]
@@ -15,11 +16,23 @@ from app.models.incident import Incident
 from app.models.incident_assignment import IncidentAssignment
 from app.models.report import Report
 from app.models.rescue_update import RescueUpdate
+from app.models.rescue_timeline_event import RescueTimelineEvent
+from app.models.post_incident_report import PostIncidentReport, PostIncidentReportAttachment
 from app.models.user import User
-from app.routes.auth import get_current_rescue_team
+from app.routes.auth import get_current_rescue_team, get_current_user
 from app.services.notification_service import send_push_notification_task, NotificationType
 from app.services.status_transition_service import StatusTransitionService
 from app.core.statuses import IncidentStatus, ReportStatus, AssignmentStatus
+from fastapi import UploadFile, File
+import os
+import uuid
+from supabase import create_client, Client
+from typing import List
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase: Client | None = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+
 
 router = APIRouter(prefix="/rescue", tags=["Rescue Team"])
 
@@ -35,9 +48,40 @@ class StatusUpdateRequest(BaseModel):
     status: str  # Accepted | In Progress | Completed | Cancelled
 
 
-class PostIncidentReportRequest(BaseModel):
-    post_incident_report: str
 
+
+class TimelineEventCreateRequest(BaseModel):
+    title: str
+    description: Optional[str] = None
+    event_type: str = "MANUAL"
+
+class TimelineEventUpdateRequest(BaseModel):
+    description: str
+
+# ======================
+# Live Situation Update Schema
+# ======================
+class LiveUpdateCreateRequest(BaseModel):
+    category: str
+    severity: str
+    message: str
+    media_url: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    visibility: str = "Public"
+    device_time: Optional[datetime] = None
+
+# ======================
+# Operation Media Schema
+# ======================
+class OperationMediaItem(BaseModel):
+    url: str
+    filename: Optional[str] = None
+    size: Optional[int] = None
+    title: Optional[str] = None
+
+class OperationMediaCreateRequest(BaseModel):
+    media: List[OperationMediaItem]
 
 # ======================
 # Get Rescue Team Profile + Stats
@@ -79,13 +123,21 @@ def get_all_reports(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_rescue_team)
 ):
-    reports = db.query(Incident).filter(Incident.status.in_(["Verified", "Assigned"])).all()
+    reports = db.query(Incident).filter(
+        Incident.status.notin_(["Pending", "Rejected"]),
+        Incident.verified == True
+    ).all()
 
     data = []
     for r in reports:
         reporter_name = "Unknown Reporter"
-        if r.reports and len(r.reports) > 0 and r.reports[0].user:
-            reporter_name = r.reports[0].user.full_name or r.reports[0].user.email or "Unknown Reporter"
+        if r.reports and len(r.reports) > 0:
+            # Sort reports by timestamp to ensure we get the earliest (primary) reporter
+            sorted_reports = sorted(r.reports, key=lambda rep: getattr(rep, 'timestamp', None) or datetime.max)
+            if sorted_reports[0].user:
+                reporter_name = sorted_reports[0].user.full_name or sorted_reports[0].user.email or "Unknown Reporter"
+
+        team_assignment = next((a for a in r.assignments if a.team_id == current_user.id), None)
 
         data.append({
             "incidentId": str(r.id),
@@ -98,6 +150,8 @@ def get_all_reports(
             "status": r.status,
             "verificationStatus": "Verified",
             "reportedAt": r.created_at.isoformat() if r.created_at else None,
+            "teamAssignmentStatus": team_assignment.status if team_assignment else None,
+            "isAssignedToCurrentTeam": team_assignment is not None,
             "location": {
                 "address": r.location,
                 "latitude": r.latitude,
@@ -110,9 +164,12 @@ def get_all_reports(
                     "url": m.file_path
                 } for m in r.media
             ] if hasattr(r, "media") and r.media else [],
+            "sources": r.sources or 1,
             "actions": {
-                "canAssign": False,
-                "canViewDetails": True
+                "canAcknowledge": bool(team_assignment and team_assignment.status == "Assigned"),
+                "canUpdateStatus": bool(team_assignment and team_assignment.status == "Accepted"),
+                "canSubmitReport": bool(team_assignment and team_assignment.status in ["In Progress", "Completed"]),
+                "rescueUpdateId": team_assignment.id if team_assignment else None
             }
         })
 
@@ -370,8 +427,11 @@ def get_my_assignments(
         can_submit_report = a.status == AssignmentStatus.COMPLETED and (not rescue_update or not rescue_update.post_incident_report)
 
         reporter_name = "Unknown Reporter"
-        if incident.reports and len(incident.reports) > 0 and incident.reports[0].user:
-            reporter_name = incident.reports[0].user.full_name or incident.reports[0].user.email or "Unknown Reporter"
+        if incident.reports and len(incident.reports) > 0:
+            # Sort reports by timestamp to ensure we get the earliest (primary) reporter
+            sorted_reports = sorted(incident.reports, key=lambda rep: getattr(rep, 'timestamp', None) or datetime.max)
+            if sorted_reports[0].user:
+                reporter_name = sorted_reports[0].user.full_name or sorted_reports[0].user.email or "Unknown Reporter"
 
         data.append({
             "assignmentId": str(a.id),
@@ -388,6 +448,8 @@ def get_my_assignments(
             "status": a.status,
             "verificationStatus": "Verified",
             "assignedAt": a.assigned_at.isoformat() if a.assigned_at else None,
+            "acceptedAt": a.accepted_at.isoformat() if a.accepted_at else None,
+            "assignedBy": a.assigned_by.full_name or a.assigned_by.email if a.assigned_by else "System",
             "reportedAt": incident.created_at.isoformat() if incident.created_at else None,
             "location": {
                 "address": incident.location,
@@ -401,6 +463,7 @@ def get_my_assignments(
                     "url": m.file_path
                 } for m in incident.media
             ] if hasattr(incident, "media") and incident.media else [],
+            "sources": incident.sources or 1,
             "rescueTeam": {
                 "id": str(current_user.id),
                 "name": current_user.full_name or current_user.email
@@ -420,13 +483,11 @@ def get_my_assignments(
 
 
 # ======================
-# Submit Post-Incident Report
-# Only allowed when operation status is Completed
+# Get Post-Incident Report
 # ======================
-@router.post("/operations/{assignment_id}/post-incident-report")
-def submit_post_incident_report(
+@router.get("/operations/{assignment_id}/post-incident-report")
+def get_post_incident_report(
     assignment_id: int,
-    payload: PostIncidentReportRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_rescue_team)
 ):
@@ -437,34 +498,170 @@ def submit_post_incident_report(
     if not assignment:
         raise HTTPException(status_code=404, detail="Rescue assignment not found")
 
-    # Only the assigned rescue team member can submit
+    report = db.query(PostIncidentReport).filter(PostIncidentReport.assignment_id == assignment_id).first()
+    
+    if not report:
+        return {
+            "success": True,
+            "data": None
+        }
+
+    attachments = [{
+        "id": att.id,
+        "original_filename": att.original_filename,
+        "file_url": att.file_url,
+        "file_size": att.file_size,
+        "uploaded_at": att.uploaded_at.isoformat() if att.uploaded_at else None
+    } for att in report.attachments]
+    
+    return {
+        "success": True,
+        "data": {
+            "id": report.id,
+            "created_at": report.created_at.isoformat() if report.created_at else None,
+            "attachments": attachments
+        }
+    }
+
+
+# ======================
+# Upload PDF Attachments
+# ======================
+@router.post("/operations/{assignment_id}/post-incident-report/attachments")
+async def upload_report_attachments(
+    assignment_id: int,
+    files: List[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_rescue_team)
+):
+    assignment = db.query(IncidentAssignment).filter(IncidentAssignment.id == assignment_id).first()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Rescue assignment not found")
+        
     if str(assignment.team_id) != str(current_user.id):
-        raise HTTPException(
-            status_code=403,
-            detail="You can only submit reports for your own operations"
-        )
+        raise HTTPException(status_code=403, detail="Not authorized to upload attachments for this report")
 
-    # Post-incident report only allowed after operation is Completed
-    if assignment.status != AssignmentStatus.COMPLETED:
-        raise HTTPException(
-            status_code=400,
-            detail="Post-incident report can only be submitted when status is 'Completed'"
-        )
+    report = db.query(PostIncidentReport).filter(PostIncidentReport.assignment_id == assignment_id).first()
+    if not report:
+        report = PostIncidentReport(assignment_id=assignment.id, incident_id=assignment.incident_id)
+        db.add(report)
+        db.commit()
+        db.refresh(report)
 
-    report_log = RescueUpdate(
-        incident_id=assignment.incident_id,
-        rescue_team_id=current_user.id,
-        post_incident_report=payload.post_incident_report,
-        message="Post-incident report submitted."
-    )
-    db.add(report_log)
-    db.commit()
-    db.refresh(report_log)
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase client not configured on server")
+
+    MAX_FILE_SIZE = 20 * 1024 * 1024 # 20MB
+    uploaded_records = []
+
+    for file in files:
+        if file.content_type != "application/pdf" and not file.filename.lower().endswith('.pdf'):
+            raise HTTPException(status_code=400, detail=f"File {file.filename} is not a PDF")
+            
+        file_bytes = await file.read()
+        if len(file_bytes) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=400, detail=f"File {file.filename} exceeds 20MB limit")
+        
+        stored_filename = f"{uuid.uuid4()}.pdf"
+        storage_path = f"reports/{report.id}/{stored_filename}"
+
+        # Upload to supabase (assuming 'media' bucket, or maybe 'reports' bucket. We will use 'media' bucket as it is likely existing)
+        try:
+            res = supabase.storage.from_("media").upload(
+                path=storage_path,
+                file=file_bytes,
+                file_options={"content-type": "application/pdf"}
+            )
+            public_url = supabase.storage.from_("media").get_public_url(storage_path)
+            
+            # DB Insertion
+            attachment = PostIncidentReportAttachment(
+                post_incident_report_id=report.id,
+                original_filename=file.filename,
+                stored_filename=stored_filename,
+                file_url=public_url,
+                file_size=len(file_bytes),
+                mime_type="application/pdf"
+            )
+            db.add(attachment)
+            db.commit()
+            db.refresh(attachment)
+            
+            uploaded_records.append({
+                "id": attachment.id,
+                "original_filename": attachment.original_filename,
+                "file_url": attachment.file_url,
+                "file_size": attachment.file_size,
+                "uploaded_at": attachment.uploaded_at.isoformat() if attachment.uploaded_at else None
+            })
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            # If upload fails, continue with other files or rollback? The user asked for "No orphan files remain after failures."
+            # We rollback DB if storage fails automatically by not committing.
+            raise HTTPException(status_code=500, detail=f"Failed to upload {file.filename}: {str(e)}")
 
     return {
-        "message": "Post-incident report submitted successfully",
-        "rescue_update_id": report_log.id,
-        "submitted_by": current_user.email
+        "success": True,
+        "message": f"Successfully uploaded {len(uploaded_records)} attachments",
+        "attachments": uploaded_records
+    }
+
+
+# ======================
+# Delete PDF Attachment
+# ======================
+@router.delete("/reports/{report_id}/attachments/{attachment_id}")
+def delete_report_attachment(
+    report_id: int,
+    attachment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_rescue_team)
+):
+    report = db.query(PostIncidentReport).filter(PostIncidentReport.id == report_id).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+        
+    assignment = db.query(IncidentAssignment).filter(IncidentAssignment.id == report.assignment_id).first()
+    if not assignment or str(assignment.team_id) != str(current_user.id):
+        raise HTTPException(status_code=403, detail="Not authorized to delete attachments for this report")
+
+    attachment = db.query(PostIncidentReportAttachment).filter(
+        PostIncidentReportAttachment.id == attachment_id,
+        PostIncidentReportAttachment.post_incident_report_id == report_id
+    ).first()
+
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase client not configured on server")
+
+    storage_path = f"reports/{report_id}/{attachment.stored_filename}"
+    
+    try:
+        supabase.storage.from_("media").remove([storage_path])
+        db.delete(attachment)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to delete attachment: {str(e)}")
+
+    # Return updated list
+    remaining = db.query(PostIncidentReportAttachment).filter(
+        PostIncidentReportAttachment.post_incident_report_id == report_id
+    ).order_by(PostIncidentReportAttachment.uploaded_at).all()
+    
+    return {
+        "success": True,
+        "message": "Attachment deleted successfully",
+        "attachments": [{
+            "id": att.id,
+            "original_filename": att.original_filename,
+            "file_url": att.file_url,
+            "file_size": att.file_size,
+            "uploaded_at": att.uploaded_at.isoformat() if att.uploaded_at else None
+        } for att in remaining]
     }
 
 
@@ -596,4 +793,384 @@ def get_completed_assignments(
         "success": True,
         "message": "Completed tasks fetched successfully",
         "data": data
+    }
+
+
+# ======================
+# Post Live Situation Update
+# ======================
+@router.post("/incidents/{incident_id}/live-updates")
+def post_live_update(
+    incident_id: int,
+    payload: LiveUpdateCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_rescue_team)
+):
+    from app.models.rescue_live_update import RescueLiveUpdate
+    from app.models.incident_assignment import IncidentAssignment
+    
+    # 1. Ensure team is assigned and status is In Progress
+    assignment = db.query(IncidentAssignment).filter(
+        IncidentAssignment.incident_id == incident_id,
+        IncidentAssignment.team_id == current_user.id
+    ).first()
+    
+    if not assignment:
+        raise HTTPException(status_code=403, detail="Not assigned to this incident.")
+        
+    if assignment.status != AssignmentStatus.IN_PROGRESS:
+        raise HTTPException(
+            status_code=400, 
+            detail="Live updates can only be posted while the operation is In Progress."
+        )
+        
+    # 2. Rate Limiting Check
+    last_update = db.query(RescueLiveUpdate).filter(
+        RescueLiveUpdate.assignment_id == assignment.id
+    ).order_by(RescueLiveUpdate.created_at.desc()).first()
+    
+    if last_update:
+        time_since_last = (datetime.utcnow() - last_update.created_at).total_seconds()
+        if time_since_last < 10:
+            raise HTTPException(status_code=429, detail="Please wait before posting another update.")
+            
+    # 3. Create Update
+    live_update = RescueLiveUpdate(
+        incident_id=incident_id,
+        assignment_id=assignment.id,
+        team_id=current_user.id,
+        team_name=current_user.full_name or current_user.email or "Rescue Team",
+        category=payload.category,
+        severity=payload.severity,
+        message=payload.message,
+        media_url=payload.media_url,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        visibility=payload.visibility,
+        device_time=payload.device_time
+    )
+    
+    db.add(live_update)
+    db.commit()
+    db.refresh(live_update)
+    
+    # Trigger notifications using existing task
+    send_push_notification_task(
+        db,
+        title="Live Rescue Update",
+        body=f"[{payload.category}] {payload.message}",
+        data={"incident_id": str(incident_id), "type": "LIVE_UPDATE"},
+        notification_type=NotificationType.DISASTER_UPDATE
+    )
+    
+    return {
+        "success": True,
+        "message": "Live update posted successfully",
+        "data": {
+            "id": live_update.id
+        }
+    }
+
+
+# ======================
+# Timeline API (Phase 8)
+# ======================
+@router.get("/operations/{operation_id}/timeline")
+def get_timeline_events(
+    operation_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_rescue_team)
+):
+    # Verify active operation
+    assignment = db.query(IncidentAssignment).filter(
+        IncidentAssignment.incident_id == operation_id,
+        IncidentAssignment.team_id == current_user.id
+    ).first()
+    
+    if not assignment:
+        raise HTTPException(status_code=403, detail="Not assigned to this incident.")
+
+    events = db.query(RescueTimelineEvent).filter(
+        RescueTimelineEvent.incident_id == operation_id
+    ).order_by(RescueTimelineEvent.created_at.desc()).all()
+
+    media_ids = [e.media_id for e in events if e.media_id is not None]
+    media_dict = {}
+    if media_ids:
+        media_records = db.query(ReportMedia).filter(ReportMedia.id.in_(media_ids)).all()
+        media_dict = {m.id: m for m in media_records}
+
+    result = []
+    for e in events:
+        team_name = None
+        if e.team_id:
+            team = db.query(User).filter(User.id == e.team_id).first()
+            if team:
+                team_name = team.full_name or team.email
+
+        display_title = e.title
+        if e.event_type == "MEDIA_UPLOADED" and e.media_id:
+            m = media_dict.get(e.media_id)
+            if m:
+                actual_title = m.title if m.title else f"Image {e.media_id}"
+                display_title = f"📷 {actual_title} (Image)"
+
+        result.append({
+            "id": e.id,
+            "incident_id": e.incident_id,
+            "assignment_id": e.assignment_id,
+            "team_id": str(e.team_id) if e.team_id else None,
+            "team_name": team_name,
+            "created_by": str(e.created_by) if e.created_by else None,
+            "event_type": e.event_type,
+            "title": display_title,
+            "description": e.description,
+            "media_id": e.media_id,
+            "created_at": e.created_at.isoformat() if e.created_at else None,
+            "metadata_json": e.metadata_json,
+            "is_system_generated": e.is_system_generated,
+            "updated_at": e.updated_at.isoformat() if e.updated_at else None,
+            "updated_by": str(e.updated_by) if e.updated_by else None,
+            "is_edited": e.is_edited
+        })
+
+    return {
+        "success": True,
+        "data": result
+    }
+
+@router.post("/operations/{operation_id}/timeline")
+def create_manual_timeline_event(
+    operation_id: int,
+    payload: TimelineEventCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_rescue_team)
+):
+    # Verify active operation
+    assignment = db.query(IncidentAssignment).filter(
+        IncidentAssignment.incident_id == operation_id,
+        IncidentAssignment.team_id == current_user.id
+    ).first()
+    
+    if not assignment:
+        raise HTTPException(status_code=403, detail="Not assigned to this incident.")
+        
+    if assignment.status != AssignmentStatus.IN_PROGRESS:
+        raise HTTPException(
+            status_code=400, 
+            detail="Manual updates can only be posted while the operation is In Progress."
+        )
+
+    new_event = RescueTimelineEvent(
+        incident_id=operation_id,
+        assignment_id=assignment.id,
+        team_id=current_user.id,
+        created_by=current_user.id,
+        event_type=payload.event_type,
+        title=payload.title,
+        description=payload.description,
+        is_system_generated=False,
+        created_at=datetime.utcnow()
+    )
+    
+    db.add(new_event)
+    db.commit()
+    db.refresh(new_event)
+
+    return {
+        "success": True,
+        "message": "Timeline event added successfully.",
+        "data": {
+            "id": new_event.id,
+            "created_at": new_event.created_at.isoformat()
+        }
+    }
+
+
+@router.put("/operations/timeline/{timeline_event_id}")
+def update_timeline_event(
+    timeline_event_id: int,
+    payload: TimelineEventUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role not in ["rescue", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized to access timeline.")
+        
+    event = db.query(RescueTimelineEvent).filter(RescueTimelineEvent.id == timeline_event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Timeline event not found.")
+
+    if current_user.role != "admin" and str(event.created_by) != str(current_user.id):
+        raise HTTPException(status_code=403, detail="Not authorized to edit this timeline event.")
+
+    new_description = payload.description.strip()
+    if not new_description:
+        raise HTTPException(status_code=400, detail="Description cannot be empty.")
+
+    team_name = None
+    if event.team_id:
+        team = db.query(User).filter(User.id == event.team_id).first()
+        if team:
+            team_name = team.full_name or team.email
+
+    current_description = (event.description or "").strip()
+    if new_description == current_description:
+        return {
+            "id": event.id,
+            "incident_id": event.incident_id,
+            "assignment_id": event.assignment_id,
+            "team_id": str(event.team_id) if event.team_id else None,
+            "team_name": team_name,
+            "created_by": str(event.created_by) if event.created_by else None,
+            "event_type": event.event_type,
+            "title": event.title,
+            "description": event.description,
+            "created_at": event.created_at.isoformat() if event.created_at else None,
+            "metadata_json": event.metadata_json,
+            "is_system_generated": event.is_system_generated,
+            "updated_at": event.updated_at.isoformat() if event.updated_at else None,
+            "updated_by": str(event.updated_by) if event.updated_by else None,
+            "is_edited": event.is_edited
+        }
+
+    event.description = new_description
+    event.updated_at = datetime.utcnow()
+    event.updated_by = current_user.id
+    event.is_edited = True
+
+    db.commit()
+    db.refresh(event)
+
+    return {
+        "id": event.id,
+        "incident_id": event.incident_id,
+        "assignment_id": event.assignment_id,
+        "team_id": str(event.team_id) if event.team_id else None,
+        "team_name": team_name,
+        "created_by": str(event.created_by) if event.created_by else None,
+        "event_type": event.event_type,
+        "title": event.title,
+        "description": event.description,
+        "created_at": event.created_at.isoformat() if event.created_at else None,
+        "metadata_json": event.metadata_json,
+        "is_system_generated": event.is_system_generated,
+        "updated_at": event.updated_at.isoformat() if event.updated_at else None,
+        "updated_by": str(event.updated_by) if event.updated_by else None,
+        "is_edited": event.is_edited
+    }
+
+
+@router.delete("/operations/timeline/{timeline_event_id}")
+def delete_timeline_event(
+    timeline_event_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    from fastapi.responses import Response
+    
+    if current_user.role not in ["rescue", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized to access timeline.")
+        
+    event = db.query(RescueTimelineEvent).filter(RescueTimelineEvent.id == timeline_event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Timeline event not found.")
+
+    if current_user.role != "admin" and str(event.created_by) != str(current_user.id):
+        raise HTTPException(status_code=403, detail="Not authorized to delete this timeline event.")
+
+    db.delete(event)
+    db.commit()
+
+    return Response(status_code=204)
+
+@router.post("/operations/{operation_id}/media")
+def upload_operation_media(
+    operation_id: int,
+    payload: OperationMediaCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_rescue_team)
+):
+    assignment = db.query(IncidentAssignment).filter(
+        IncidentAssignment.incident_id == operation_id,
+        IncidentAssignment.team_id == current_user.id
+    ).first()
+    
+    if not assignment:
+        raise HTTPException(status_code=403, detail="Not assigned to this incident.")
+        
+    created_media = []
+    
+    for item in payload.media:
+        new_media = ReportMedia(
+            user_id=current_user.id,
+            incident_id=operation_id,
+            assignment_id=assignment.id,
+            file_path=item.url,
+            file_type="image",
+            original_filename=item.filename,
+            title=item.title,
+            file_size=item.size,
+            created_at=datetime.utcnow()
+        )
+        db.add(new_media)
+        db.flush()
+        
+        # Automatically generate timeline event
+        new_event = RescueTimelineEvent(
+            incident_id=operation_id,
+            assignment_id=assignment.id,
+            team_id=current_user.id,
+            created_by=current_user.id,
+            event_type="MEDIA_UPLOADED",
+            title=item.title if item.title else "Image Uploaded",
+            description=None,
+            media_id=new_media.id,
+            is_system_generated=True,
+            created_at=datetime.utcnow()
+        )
+        db.add(new_event)
+        
+        created_media.append(new_media)
+        
+    db.commit()
+    
+    return {
+        "success": True,
+        "message": f"Successfully attached {len(payload.media)} media files.",
+        "data": [{"id": m.id, "url": m.file_path} for m in created_media]
+    }
+
+
+@router.get("/operations/{operation_id}/media")
+def get_operation_media(
+    operation_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role not in ["rescue", "admin"]:
+        raise HTTPException(status_code=403, detail="Not authorized.")
+        
+    media_files = db.query(ReportMedia).filter(
+        ReportMedia.incident_id == operation_id,
+        ReportMedia.assignment_id != None
+    ).order_by(ReportMedia.created_at.asc()).all()
+    
+    result = []
+    for m in media_files:
+        result.append({
+            "id": m.id,
+            "incident_id": m.incident_id,
+            "assignment_id": m.assignment_id,
+            "user_id": str(m.user_id),
+            "file_path": m.file_path,
+            "original_filename": m.original_filename,
+            "title": m.title,
+            "file_size": m.file_size,
+            "created_at": m.created_at.isoformat() if m.created_at else None
+        })
+        
+    return {
+        "success": True,
+        "data": result
     }

@@ -1,4 +1,5 @@
 from sqlalchemy.orm import Session
+from datetime import datetime
 # pyrefly: ignore [missing-import]
 from fastapi import HTTPException
 from app.models.incident import Incident
@@ -10,6 +11,7 @@ from app.core.statuses import (
     INCIDENT_TRANSITIONS, REPORT_TRANSITIONS, ASSIGNMENT_TRANSITIONS,
     INCIDENT_PERMISSIONS, REPORT_PERMISSIONS, ASSIGNMENT_PERMISSIONS
 )
+from app.models.rescue_timeline_event import RescueTimelineEvent
 
 class StatusTransitionService:
 
@@ -83,6 +85,19 @@ class StatusTransitionService:
             incident.verified = False
 
         StatusTransitionService._record_history(db, 'Incident', incident_id, old_status, new_status, user_id, remarks)
+        
+        # Create timeline event for incident verification
+        if old_status == IncidentStatus.PENDING and new_status == IncidentStatus.VERIFIED:
+            event = RescueTimelineEvent(
+                incident_id=incident_id,
+                created_by=user_id,
+                event_type="SYSTEM",
+                title="Disaster verified by Admin",
+                is_system_generated=True,
+                created_at=datetime.utcnow()
+            )
+            db.add(event)
+            
         return incident
 
     @staticmethod
@@ -115,7 +130,37 @@ class StatusTransitionService:
         StatusTransitionService._validate_transition('Assignment', old_status, new_status, user_role)
         
         assignment.status = new_status
+        if new_status == AssignmentStatus.ACCEPTED and assignment.accepted_at is None:
+            assignment.accepted_at = datetime.utcnow()
+            
         StatusTransitionService._record_history(db, 'Assignment', assignment_id, old_status, new_status, user_id, remarks)
+        
+        # Timeline Event Generation for Assignment Changes
+        event_title = ""
+        if new_status == AssignmentStatus.ASSIGNED:
+            event_title = "Team assigned by Admin"
+        elif new_status == AssignmentStatus.ACCEPTED:
+            event_title = "Team accepted assignment"
+        elif new_status == AssignmentStatus.REJECTED:
+            event_title = "Team rejected assignment"
+        elif new_status == AssignmentStatus.IN_PROGRESS:
+            event_title = "Team started operation"
+        elif new_status == AssignmentStatus.COMPLETED:
+            event_title = "Team marked operation completed"
+
+        if event_title:
+            event = RescueTimelineEvent(
+                incident_id=assignment.incident_id,
+                assignment_id=assignment_id,
+                team_id=assignment.team_id,
+                created_by=user_id,
+                event_type="SYSTEM",
+                title=event_title,
+                is_system_generated=True,
+                created_at=datetime.utcnow()
+            )
+            db.add(event)
+
         
         # After saving assignment, flush and check if parent incident needs auto-updating
         db.flush()
