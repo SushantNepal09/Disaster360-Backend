@@ -32,3 +32,4 @@ set -e
 # --- 2. Start Server ---
 echo "Starting FastAPI server..."
 exec uvicorn app.main2:app2 --host 0.0.0.0 --port ${PORT:-8000}
+# Trigger render deploy
