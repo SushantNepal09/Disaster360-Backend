@@ -1,5 +1,5 @@
 # pyrefly: ignore [missing-import]
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import Session
 
@@ -14,13 +14,17 @@ from app.models.incident_assignment import IncidentAssignment
 from app.models.report import Report
 from app.models.report_reaction import ReportReaction
 from app.models.user import User
-from app.routes.auth import get_current_admin
+from app.models.admin_report_attachment import AdminReportAttachment
+from app.routes.auth import get_current_admin, ChangePasswordRequest
+from app.auth.auth_utils import change_user_password
 from datetime import datetime, timedelta, timezone
 
 from app.services.geo_service import get_users_to_notify
 from app.services.notification_service import send_push_notification_task, NotificationType
 from app.services.status_transition_service import StatusTransitionService
 from app.core.statuses import IncidentStatus, ReportStatus, AssignmentStatus
+from app.routes.rescue import supabase
+import uuid
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 
@@ -45,9 +49,116 @@ class ReportUpdateRequest(BaseModel):
     severity: Optional[str] = None
 
 
+class DisasterAlertRequest(BaseModel):
+    title: str
+    message: Optional[str] = None
+    body: Optional[str] = None
+    incident_id: Optional[int] = None
+    target_audience: str = "all"  # "all", "affected", "selected"
+    selected_user_ids: Optional[List[str]] = None
+    priority: Optional[str] = "high"
+
+
 
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import joinedload
+
+# ======================
+# Change Password (Admin)
+# ======================
+@router.post("/change-password")
+def admin_change_password(
+    payload: ChangePasswordRequest,
+    current_user: User = Depends(get_current_admin),
+    db: Session = Depends(get_db)
+):
+    return change_user_password(
+        db=db,
+        user=current_user,
+        current_password=payload.current_password,
+        new_password=payload.new_password,
+        confirm_password=payload.confirm_password,
+    )
+
+
+# ======================
+# Send Disaster Alert Notification (Admin only)
+# ======================
+@router.post("/notifications/send-alert")
+@router.post("/alerts")
+def send_disaster_alert(
+    payload: DisasterAlertRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin)
+):
+    alert_body = payload.message or payload.body
+    if not alert_body:
+        raise HTTPException(status_code=400, detail="Alert message/body is required")
+
+    target_type = payload.target_audience.lower().strip()
+    user_ids = []
+
+    if target_type in ["all", "everyone"]:
+        users = db.query(User).all()
+        user_ids = [str(u.id) for u in users]
+    elif target_type in ["affected", "nearby", "disaster"]:
+        if not payload.incident_id:
+            raise HTTPException(status_code=400, detail="incident_id is required when target_audience is 'affected'")
+        incident = db.query(Incident).filter(Incident.id == payload.incident_id).first()
+        if not incident:
+            raise HTTPException(status_code=404, detail="Incident not found")
+        
+        reporter_ids = [str(r.user_id) for r in incident.reports if r.user_id]
+        
+        DISASTER_RADIUS_KM = {"flood": 5.0, "landslide": 3.0, "earthquake": 50.0, "fire": 2.0, "default": 5.0}
+        radius_km = DISASTER_RADIUS_KM.get(incident.disaster_type.lower() if incident.disaster_type else "default", 5.0)
+        
+        incident_local_unit = None
+        if incident.location:
+            parts = incident.location.split(",")
+            incident_local_unit = parts[-1].strip() if parts else incident.location.strip()
+            
+        nearby_users = get_users_to_notify(db, incident.latitude, incident.longitude, radius_km, incident_local_unit) if incident.latitude and incident.longitude else []
+        nearby_user_ids = [str(u.id) for u in nearby_users]
+        user_ids = list(set(reporter_ids + nearby_user_ids))
+    elif target_type in ["selected", "custom", "users"]:
+        if not payload.selected_user_ids:
+            raise HTTPException(status_code=400, detail="selected_user_ids is required when target_audience is 'selected'")
+        user_ids = payload.selected_user_ids
+    else:
+        raise HTTPException(status_code=400, detail="Invalid target_audience. Must be 'all', 'affected', or 'selected'")
+
+    if not user_ids:
+        return {
+            "success": True,
+            "message": "No users found in the target audience to notify",
+            "notified_count": 0
+        }
+
+    data_payload = {
+        "priority": payload.priority or "high",
+        "sender": "admin",
+        "sender_id": str(current_user.id)
+    }
+    if payload.incident_id:
+        data_payload["incident_id"] = str(payload.incident_id)
+
+    background_tasks.add_task(
+        send_push_notification_task,
+        user_ids=user_ids,
+        notification_type=NotificationType.DISASTER_ALERT,
+        title=payload.title,
+        body=alert_body,
+        data=data_payload
+    )
+
+    return {
+        "success": True,
+        "message": f"Disaster alert queued successfully for {len(user_ids)} user(s)",
+        "notified_count": len(user_ids)
+    }
+
 
 # ======================
 # Get All Reports (approved admin only)
@@ -309,7 +420,8 @@ def admin_assign_team(
                 incident_id=incident.id, 
                 team_name=u.full_name or u.email, 
                 team_id=u.id,
-                status=AssignmentStatus.ASSIGNED
+                status=AssignmentStatus.ASSIGNED,
+                assigned_by_id=current_user.id
             )
             db.add(new_assign)
             db.flush()
@@ -411,6 +523,63 @@ def admin_undo_reject_report(
     return {
         "message": f"Incident {report_id} is now Pending again",
         "restored_by": current_user.email
+    }
+
+# ======================
+# Get Closure Report
+# ======================
+@router.get("/reports/{incident_id}/closure-report")
+def get_closure_report(
+    incident_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_admin)
+):
+    from app.models.post_incident_report import PostIncidentReport
+    from app.models.rescue_timeline_event import RescueTimelineEvent
+    
+    report = db.query(PostIncidentReport).filter(PostIncidentReport.incident_id == incident_id).first()
+    
+    closure_update = db.query(RescueTimelineEvent).filter(
+        RescueTimelineEvent.incident_id == incident_id,
+        RescueTimelineEvent.title == 'Post-Incident Report Submitted'
+    ).order_by(RescueTimelineEvent.created_at.desc()).first()
+
+    if not report and not closure_update:
+        return {"success": True, "data": None}
+
+    attachments = []
+    if report and getattr(report, "attachments", None):
+        attachments = [{
+            "id": att.id,
+            "original_filename": att.original_filename,
+            "file_url": att.file_url,
+            "file_size": att.file_size,
+            "uploaded_at": att.uploaded_at.isoformat() if att.uploaded_at else None
+        } for att in report.attachments]
+        
+    team_name = "Unknown Team"
+    if report and getattr(report, "assignment", None) and getattr(report.assignment, "team", None):
+        team_name = report.assignment.team.full_name
+    elif closure_update:
+        team = db.query(User).filter(User.id == closure_update.team_id).first()
+        if team:
+            team_name = team.full_name
+
+    closed_date = None
+    if report and report.created_at:
+        closed_date = report.created_at.isoformat()
+    elif closure_update and closure_update.created_at:
+        closed_date = closure_update.created_at.isoformat()
+
+    return {
+        "success": True,
+        "data": {
+            "incident_id": incident_id,
+            "closing_description": closure_update.description if closure_update else None,
+            "closed_date": closed_date,
+            "team_name": team_name,
+            "attachments": attachments
+        }
     }
 
 # ======================
@@ -733,38 +902,9 @@ def get_incident_history(
     db: Session = Depends(get_db),
     current_admin: User = Depends(get_current_admin)
 ):
-    # pyrefly: ignore [missing-import]
-    from app.models.status_history import StatusHistory
+    from app.services.timeline_service import TimelineService
     
-    # We want history of the Incident itself, and any Assignments belonging to this Incident.
-    assignments = db.query(IncidentAssignment).filter(IncidentAssignment.incident_id == incident_id).all()
-    assignment_ids = [a.id for a in assignments]
-
-    # Query StatusHistory
-    history_records = db.query(StatusHistory).filter(
-        ((StatusHistory.entity_type == "Incident") & (StatusHistory.entity_id == incident_id)) |
-        ((StatusHistory.entity_type == "Assignment") & (StatusHistory.entity_id.in_(assignment_ids)))
-    ).order_by(StatusHistory.timestamp.desc()).all()
-
-    data = []
-    for h in history_records:
-        role = "System"
-        if h.changed_by:
-            user = db.query(User).filter(User.id == h.changed_by).first()
-            if user:
-                role = user.role.value if hasattr(user.role, 'value') else str(user.role)
-        
-        data.append({
-            "id": h.id,
-            "entity_type": h.entity_type,
-            "entity_id": h.entity_id,
-            "old_status": h.old_status,
-            "new_status": h.new_status,
-            "changed_by": str(h.changed_by) if h.changed_by else None,
-            "changed_by_role": role,
-            "remarks": h.remarks,
-            "created_at": h.timestamp.isoformat() if h.timestamp else None
-        })
+    data = TimelineService.build_incident_timeline(db, incident_id)
 
     return {
         "success": True,
@@ -891,3 +1031,96 @@ def submit_final_admin_report(
         "incident_id": incident.id
     }
 
+
+
+# ======================
+# Upload Admin Report Attachments
+# ======================
+@router.post("/incidents/{incident_id}/admin-report/attachments")
+async def upload_admin_report_attachments(
+    incident_id: int,
+    files: List[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(get_current_admin)
+):
+    incident = db.query(Incident).filter(Incident.id == incident_id).first()
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+        
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase client not configured")
+
+    MAX_FILE_SIZE = 20 * 1024 * 1024 # 20MB
+    uploaded_records = []
+
+    for file in files:
+        file_bytes = await file.read()
+        if len(file_bytes) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=400, detail=f"File {file.filename} is too large (max 20MB)")
+        if not file.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail=f"File {file.filename} must be a PDF")
+
+        stored_filename = f"{uuid.uuid4()}.pdf"
+        try:
+            res = supabase.storage.from_("media").upload(f"admin_reports/{incident_id}/{stored_filename}", file_bytes, {"content-type": "application/pdf"})
+            file_url = supabase.storage.from_("media").get_public_url(f"admin_reports/{incident_id}/{stored_filename}")
+
+            attachment = AdminReportAttachment(
+                incident_id=incident.id,
+                admin_id=current_admin.id,
+                original_filename=file.filename,
+                stored_filename=stored_filename,
+                file_url=file_url,
+                file_size=len(file_bytes),
+                mime_type="application/pdf"
+            )
+            db.add(attachment)
+            uploaded_records.append(attachment)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to upload {file.filename}: {str(e)}")
+
+    db.commit()
+    for rec in uploaded_records:
+        db.refresh(rec)
+
+    return {
+        "success": True,
+        "message": f"Successfully uploaded {len(uploaded_records)} attachments",
+        "attachments": [
+            {
+                "id": att.id,
+                "original_filename": att.original_filename,
+                "file_url": att.file_url,
+                "file_size": att.file_size,
+                "uploaded_at": att.uploaded_at.isoformat() if att.uploaded_at else None
+            }
+            for att in uploaded_records
+        ]
+    }
+
+# ======================
+# Delete Admin Report Attachment
+# ======================
+@router.delete("/incidents/{incident_id}/admin-report/attachments/{attachment_id}")
+async def delete_admin_report_attachment(
+    incident_id: int,
+    attachment_id: int,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(get_current_admin)
+):
+    attachment = db.query(AdminReportAttachment).filter(
+        AdminReportAttachment.id == attachment_id,
+        AdminReportAttachment.incident_id == incident_id
+    ).first()
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    try:
+        supabase.storage.from_("media").remove([f"admin_reports/{incident_id}/{attachment.stored_filename}"])
+    except Exception as e:
+        print(f"Failed to delete file from storage: {e}")
+
+    db.delete(attachment)
+    db.commit()
+    
+    return {"success": True, "message": "Attachment deleted successfully"}

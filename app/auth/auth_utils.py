@@ -27,6 +27,28 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
 
+def change_user_password(
+    db,
+    user,
+    current_password: str,
+    new_password: str,
+    confirm_password: str,
+):
+    if not verify_password(current_password, user.password_hash):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Incorrect current password")
+    if new_password != confirm_password:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="New password and confirm password do not match")
+    if len(new_password) < 8:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password must be at least 8 characters long")
+    if current_password == new_password or verify_password(new_password, user.password_hash):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="New password cannot be the same as the current password")
+
+    user.password_hash = hash_password(new_password)
+    db.commit()
+    db.refresh(user)
+    return {"message": "Password changed successfully"}
+
+
 # ==============================
 # JWT Token Creation
 # ==============================

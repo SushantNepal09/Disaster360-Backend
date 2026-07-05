@@ -20,6 +20,7 @@ class IncidentAssignment(Base):
     incident_id = Column(Integer, ForeignKey("incidents.id", ondelete="CASCADE"), nullable=False)
     team_name = Column(String, nullable=False)
     team_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
+    assigned_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     
     status = Column(String, default=AssignmentStatus.ASSIGNED)
     
@@ -32,3 +33,4 @@ class IncidentAssignment(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     incident = relationship("Incident", back_populates="assignments")
+    assigned_by = relationship("User", foreign_keys=[assigned_by_id])

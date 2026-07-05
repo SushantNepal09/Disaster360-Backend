@@ -12,12 +12,15 @@ from app.core.config import settings
 from app.models.incident import Incident
 from app.models.report import Report
 from app.models.user import User
+from app.models.report_media import ReportMedia
 from app.routes.auth import get_current_user, get_optional_current_user
 from app.models.report_embedding import ReportEmbedding
+from app.models.rescue_timeline_event import RescueTimelineEvent
 from app.models.rescue_update import RescueUpdate
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import object_session
 from app.models.report_reaction import ReportReaction, ReactionType
+from app.models.report_media import ReportMedia
 from app.services.geo_service import get_users_to_notify
 from app.services.notification_service import send_push_notification_task, NotificationType
 
@@ -294,6 +297,17 @@ def process_disaster_report(payload: ReportCreateRequest, db: Session, user_id: 
         db.add(new_report)
         db.commit()
         db.refresh(new_report)
+        
+        event = RescueTimelineEvent(
+            incident_id=matched_incident.id,
+            created_by=user_id,
+            event_type="SYSTEM",
+            title=f"Citizen submitted {payload.disaster_type} report",
+            is_system_generated=True,
+            created_at=datetime.utcnow()
+        )
+        db.add(event)
+        db.commit()
 
         return new_report, {
             "message": "Your report matched an existing incident and has been merged.",
@@ -332,6 +346,17 @@ def process_disaster_report(payload: ReportCreateRequest, db: Session, user_id: 
 
         new_embedding = ReportEmbedding(incident_id=new_incident.id, embedding_vector=embedding)
         db.add(new_embedding)
+        db.commit()
+
+        event = RescueTimelineEvent(
+            incident_id=new_incident.id,
+            created_by=user_id,
+            event_type="SYSTEM",
+            title=f"Citizen submitted {payload.disaster_type} report",
+            is_system_generated=True,
+            created_at=datetime.utcnow()
+        )
+        db.add(event)
         db.commit()
 
         return new_report, {
@@ -606,3 +631,124 @@ def react_to_submission(
             break
 
     return {"likes": likes, "dislikes": dislikes, "user_reaction": user_new_reaction}
+
+
+# ======================
+# Get Unified Incident Timeline
+# ======================
+@router.get("/incidents/{incident_id}/timeline")
+def get_incident_timeline(
+    incident_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_optional_current_user)
+):
+    """
+    Returns the chronologically ordered timeline for a specific incident,
+    merging StatusHistory and RescueLiveUpdates.
+    """
+    from app.services.timeline_service import TimelineService
+    from app.models.incident import Incident
+    
+    incident = db.query(Incident).filter(Incident.id == incident_id).first()
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+        
+    timeline_data = TimelineService.build_incident_timeline(db, incident_id)
+    
+    # Role-based filtering / serialization
+    is_admin = False
+    if current_user and str(getattr(current_user, 'role', '')).lower() == 'admin':
+        is_admin = True
+        
+    filtered_timeline = []
+    for item in timeline_data:
+        if item["type"] == "LiveUpdate":
+            # If ADMIN_ONLY, exclude from citizens
+            if item.get("visibility") == "Admin Only" and not is_admin:
+                continue
+                
+        filtered_timeline.append(item)
+        
+    return {
+        "success": True,
+        "data": filtered_timeline
+    }
+
+# ======================
+# Get Rescue Timeline (RescueTimelineEvent)
+# ======================
+@router.get("/{incident_id}/rescue-timeline")
+def get_rescue_timeline(
+    incident_id: int,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_current_user)
+):
+    incident = db.query(Incident).filter(Incident.id == incident_id).first()
+    if not incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    events = db.query(
+        RescueTimelineEvent,
+        User.full_name.label("team_name"),
+        ReportMedia.file_path.label("media_url")
+    ).outerjoin(
+        User, RescueTimelineEvent.team_id == User.id
+    ).outerjoin(
+        ReportMedia, RescueTimelineEvent.media_id == ReportMedia.id
+    ).filter(
+        RescueTimelineEvent.incident_id == incident_id
+    ).order_by(RescueTimelineEvent.created_at.asc()).all()
+
+    data = []
+    for event, team_name, media_url in events:
+        data.append({
+            "id": event.id,
+            "title": event.title,
+            "description": event.description,
+            "event_type": event.event_type,
+            "created_at": event.created_at.isoformat() if event.created_at else None,
+            "team_name": team_name,
+            "media_url": media_url,
+            "is_system_generated": event.is_system_generated
+        })
+
+    return {
+        "success": True,
+        "data": data
+    }
+
+
+# ======================
+# Get Admin Post Disaster Report
+# ======================
+@router.get("/{incident_id}/admin-report")
+def get_admin_post_disaster_report(
+    incident_id: int,
+    db: Session = Depends(get_db)
+):
+    inc = db.query(Incident).filter(Incident.id == incident_id).first()
+    if not inc:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    from app.models.admin_report_attachment import AdminReportAttachment
+    attachments = db.query(AdminReportAttachment).filter(AdminReportAttachment.incident_id == incident_id).all()
+
+    att_list = []
+    for att in attachments:
+        att_list.append({
+            "id": att.id,
+            "original_filename": att.original_filename,
+            "file_url": att.file_url,
+            "file_size": att.file_size,
+            "uploaded_at": att.uploaded_at.isoformat() if att.uploaded_at else None
+        })
+
+    return {
+        "success": True,
+        "data": {
+            "incident_id": incident_id,
+            "description": inc.final_admin_report,
+            "closed_date": inc.updated_at.isoformat() if inc.updated_at else None,
+            "attachments": att_list
+        }
+    }

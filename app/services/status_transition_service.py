@@ -1,4 +1,5 @@
 from sqlalchemy.orm import Session
+from datetime import datetime
 # pyrefly: ignore [missing-import]
 from fastapi import HTTPException
 from app.models.incident import Incident
@@ -10,6 +11,7 @@ from app.core.statuses import (
     INCIDENT_TRANSITIONS, REPORT_TRANSITIONS, ASSIGNMENT_TRANSITIONS,
     INCIDENT_PERMISSIONS, REPORT_PERMISSIONS, ASSIGNMENT_PERMISSIONS
 )
+from app.models.rescue_timeline_event import RescueTimelineEvent
 
 class StatusTransitionService:
 
@@ -89,6 +91,19 @@ class StatusTransitionService:
                 )
 
         StatusTransitionService._record_history(db, 'Incident', incident_id, old_status, new_status, user_id, remarks)
+        
+        # Create timeline event for incident verification
+        if old_status == IncidentStatus.PENDING and new_status == IncidentStatus.VERIFIED:
+            event = RescueTimelineEvent(
+                incident_id=incident_id,
+                created_by=user_id,
+                event_type="SYSTEM",
+                title="Disaster verified by Admin",
+                is_system_generated=True,
+                created_at=datetime.utcnow()
+            )
+            db.add(event)
+            
         return incident
 
     @staticmethod
@@ -121,7 +136,40 @@ class StatusTransitionService:
         StatusTransitionService._validate_transition('Assignment', old_status, new_status, user_role)
         
         assignment.status = new_status
+        status_lower = str(new_status).lower()
+        if status_lower == 'accepted' and assignment.accepted_at is None:
+            assignment.accepted_at = datetime.utcnow()
+        elif status_lower == 'completed' and assignment.completed_at is None:
+            assignment.completed_at = datetime.utcnow()
+            
         StatusTransitionService._record_history(db, 'Assignment', assignment_id, old_status, new_status, user_id, remarks)
+        
+        # Timeline Event Generation for Assignment Changes
+        event_title = ""
+        if status_lower == 'assigned':
+            event_title = "Team assigned by Admin"
+        elif status_lower == 'accepted':
+            event_title = "Team accepted assignment"
+        elif status_lower == 'rejected':
+            event_title = "Team rejected assignment"
+        elif status_lower == 'in progress':
+            event_title = "Team started operation"
+        elif status_lower == 'completed':
+            event_title = "Team marked operation completed"
+
+        if event_title:
+            event = RescueTimelineEvent(
+                incident_id=assignment.incident_id,
+                assignment_id=assignment_id,
+                team_id=assignment.team_id,
+                created_by=user_id,
+                event_type="SYSTEM",
+                title=event_title,
+                is_system_generated=True,
+                created_at=datetime.utcnow()
+            )
+            db.add(event)
+
         
         # After saving assignment, flush and check if parent incident needs auto-updating
         db.flush()
@@ -142,7 +190,7 @@ class StatusTransitionService:
         assignments = db.query(IncidentAssignment).filter(IncidentAssignment.incident_id == incident_id).all()
         
         # Filter out cancelled/rejected ones for derivation logic
-        active_assignments = [a for a in assignments if a.status not in [AssignmentStatus.CANCELLED, AssignmentStatus.REJECTED]]
+        active_assignments = [a for a in assignments if str(a.status).lower() not in ['cancelled', 'rejected']]
         
         new_derived_status = None
         
@@ -150,18 +198,15 @@ class StatusTransitionService:
             # Revert to verified if all teams rejected or cancelled
             new_derived_status = IncidentStatus.VERIFIED
         else:
-            # Prioritize states: In Progress > Assigned
-            # If ANY team is in progress or accepted
-            if any(a.status in [AssignmentStatus.IN_PROGRESS, AssignmentStatus.ACCEPTED] for a in active_assignments):
+            # If ANY team has completed the operation, mark incident as Closed immediately:
+            if any(str(a.status).lower() in ['completed', 'controlled', 'closed', 'resolved'] for a in active_assignments):
+                new_derived_status = IncidentStatus.CLOSED
+            # Else if ANY team is in progress or accepted
+            elif any(str(a.status).lower() in ['in progress', 'accepted'] for a in active_assignments):
                 new_derived_status = IncidentStatus.IN_PROGRESS
             # Else if ANY team is assigned (and none accepted/in progress)
-            elif any(a.status == AssignmentStatus.ASSIGNED for a in active_assignments):
+            elif any(str(a.status).lower() == 'assigned' for a in active_assignments):
                 new_derived_status = IncidentStatus.IN_PROGRESS if incident.status == IncidentStatus.IN_PROGRESS else IncidentStatus.ASSIGNED
-            else:
-                # All active teams are Completed.
-                # Do NOT auto-transition to Controlled. Keep it whatever it was (In Progress), 
-                # Admin will manually mark it as Controlled / Closed.
-                pass
                 
         if new_derived_status and incident.status != new_derived_status:
             # Allow the service to self-transition as an 'admin' action if needed, or bypass validation

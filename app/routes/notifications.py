@@ -39,7 +39,7 @@ def get_notifications(
             if incident:
                 disaster_type = incident.disaster_type
                 # Assuming the first report created the incident
-                first_report = db.query(Report).filter(Report.incident_id == incident.id).order_by(Report.created_at).first()
+                first_report = db.query(Report).filter(Report.incident_id == incident.id).order_by(Report.timestamp).first()
                 if first_report and first_report.user_id:
                     reporter = db.query(UserModel).filter(UserModel.id == first_report.user_id).first()
                     if reporter:
