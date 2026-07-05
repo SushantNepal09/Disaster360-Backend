@@ -31,6 +31,10 @@ class NotificationType(str, enum.Enum):
     RESCUE_ASSIGNED = "rescue_assigned"
     RESCUE_UPDATE = "rescue_update"
     INCIDENT_CLOSED = "incident_closed"
+    DISASTER_ALERT = "disaster_alert"
+    DISASTER_UPDATE = "disaster_update"
+    SYSTEM = "system"
+    GENERAL_ALERT = "general_alert"
 
 
 def clean_invalid_tokens(invalid_tokens: List[str], db: Session):
@@ -116,15 +120,13 @@ def send_push_notification_task(
         data['notification_type'] = notification_type.value
         incident_id = data.get('incident_id')
         
-        # 1. Fetch valid tokens
-        users = db.query(User).filter(User.id.in_(user_ids), User.fcm_token.isnot(None)).all()
-        tokens = [u.fcm_token for u in users if u.fcm_token]
-        
-        if not tokens:
-            logger.info("No valid FCM tokens found for the targeted users.")
+        # 1. Fetch all targeted users to ensure notifications are logged in DB
+        users = db.query(User).filter(User.id.in_(user_ids)).all()
+        if not users:
+            logger.info("No users found for the targeted user_ids.")
             return
             
-        # 2. Log notification in DB
+        # 2. Log notification in DB for ALL targeted users
         try:
             for u in users:
                 log_entry = NotificationLog(
@@ -140,7 +142,12 @@ def send_push_notification_task(
             logger.error(f"Failed to log notifications: {e}")
             db.rollback()
             
-        # 3. Send via FCM in batches of 500 (FCM limit)
+        # 3. Send via FCM in batches of 500 (FCM limit) for users with valid tokens
+        tokens = [u.fcm_token for u in users if u.fcm_token]
+        if not tokens:
+            logger.info("No valid FCM tokens found among targeted users.")
+            return
+
         chunk_size = 500
         for i in range(0, len(tokens), chunk_size):
             chunk = tokens[i:i + chunk_size]

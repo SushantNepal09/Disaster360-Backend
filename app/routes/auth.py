@@ -24,6 +24,7 @@ from app.auth.auth_utils import (
     verify_password,
     create_access_token,
     verify_access_token,
+    change_user_password,
 )
 from app.auth.email_service import send_verification_email
 
@@ -59,6 +60,11 @@ class RegisterRequest(BaseModel):
 
 class ResendVerificationRequest(BaseModel):
     email: EmailStr
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+    confirm_password: str
 
 
 # ======================
@@ -329,8 +335,31 @@ def get_current_user(
             status_code=403,
             detail="Admin access has been revoked. Contact system administrator."
         )
+    if user.role == "rescue" and not is_rescue_approved(user): # type: ignore
+        raise HTTPException(
+            status_code=403,
+            detail="Rescue Team access has been revoked. Contact system administrator."
+        )
 
     return user
+
+
+# ======================
+# Change Password
+# ======================
+@router.post("/change-password")
+def change_password(
+    payload: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    return change_user_password(
+        db=db,
+        user=current_user,
+        current_password=payload.current_password,
+        new_password=payload.new_password,
+        confirm_password=payload.confirm_password,
+    )
 
 
 # pyrefly: ignore [missing-import]

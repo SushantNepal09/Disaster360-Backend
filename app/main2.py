@@ -21,6 +21,28 @@ app2.add_middleware(
     allow_headers=["*"],
 )
 
+@app2.on_event("startup")
+def sync_closed_incidents():
+    from app.database import SessionLocal
+    from app.core.statuses import IncidentStatus
+    db = SessionLocal()
+    try:
+        completed_assignments = db.query(IncidentAssignment).all()
+        for a in completed_assignments:
+            if str(a.status).lower() in ['completed', 'controlled', 'closed', 'resolved']:
+                inc = db.query(Incident).filter(Incident.id == a.incident_id).first()
+                if inc and inc.status != IncidentStatus.CLOSED:
+                    inc.status = IncidentStatus.CLOSED
+                    inc.verified = True
+                    for r in inc.reports:
+                        r.status = IncidentStatus.CLOSED
+                        r.verified = True
+        db.commit()
+    except Exception as e:
+        print("Startup sync error:", e)
+    finally:
+        db.close()
+
 @app2.get("/")
 def home():
     return {"message": "DISASTER360 Backend Running"}

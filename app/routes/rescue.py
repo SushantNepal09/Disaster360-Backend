@@ -19,7 +19,8 @@ from app.models.rescue_update import RescueUpdate
 from app.models.rescue_timeline_event import RescueTimelineEvent
 from app.models.post_incident_report import PostIncidentReport, PostIncidentReportAttachment
 from app.models.user import User
-from app.routes.auth import get_current_rescue_team, get_current_user
+from app.routes.auth import get_current_rescue_team, get_current_user, ChangePasswordRequest
+from app.auth.auth_utils import change_user_password
 from app.services.notification_service import send_push_notification_task, NotificationType
 from app.services.status_transition_service import StatusTransitionService
 from app.core.statuses import IncidentStatus, ReportStatus, AssignmentStatus
@@ -84,6 +85,24 @@ class OperationMediaCreateRequest(BaseModel):
     media: List[OperationMediaItem]
 
 # ======================
+# Change Password (Rescue Team)
+# ======================
+@router.post("/change-password")
+def rescue_change_password(
+    payload: ChangePasswordRequest,
+    current_user: User = Depends(get_current_rescue_team),
+    db: Session = Depends(get_db)
+):
+    return change_user_password(
+        db=db,
+        user=current_user,
+        current_password=payload.current_password,
+        new_password=payload.new_password,
+        confirm_password=payload.confirm_password,
+    )
+
+
+# ======================
 # Get Rescue Team Profile + Stats
 # ======================
 @router.get("/profile")
@@ -141,6 +160,8 @@ def get_all_reports(
 
         data.append({
             "incidentId": str(r.id),
+            "assignmentId": str(team_assignment.id) if team_assignment else "",
+            "assignment_id": team_assignment.id if team_assignment else None,
             "reporterName": reporter_name,
             "reporterStatus": "Active",
             "title": r.title,
@@ -282,6 +303,21 @@ def update_rescue_status(
                 f"Rescue team status updated to: {payload.status}",
                 {"incident_id": str(incident.id)}
             )
+        if incident.status == IncidentStatus.CLOSED:
+            from app.services.geo_service import get_users_to_notify
+            DISASTER_RADIUS_KM = {"flood": 5.0, "landslide": 3.0, "earthquake": 50.0, "fire": 2.0, "default": 5.0}
+            radius_km = DISASTER_RADIUS_KM.get(incident.disaster_type.lower() if incident.disaster_type else "default", 5.0)
+            nearby_users = get_users_to_notify(db, incident.latitude, incident.longitude, radius_km, getattr(incident, 'local_unit', None)) if incident.latitude and incident.longitude else []
+            user_ids = [str(u.id) for u in nearby_users]
+            if user_ids:
+                background_tasks.add_task(
+                    send_push_notification_task,
+                    user_ids,
+                    NotificationType.INCIDENT_CLOSED,
+                    "Incident Resolved",
+                    "The area is now safe. The disaster has been resolved.",
+                    {"incident_id": str(incident.id)}
+                )
 
     return {
         "message": "Rescue assignment status updated successfully",
@@ -494,11 +530,16 @@ def get_post_incident_report(
     assignment = db.query(IncidentAssignment).filter(
         IncidentAssignment.id == assignment_id
     ).first()
+    if not assignment:
+        assignment = db.query(IncidentAssignment).filter(
+            IncidentAssignment.incident_id == assignment_id,
+            IncidentAssignment.team_id == current_user.id
+        ).first()
 
     if not assignment:
         raise HTTPException(status_code=404, detail="Rescue assignment not found")
 
-    report = db.query(PostIncidentReport).filter(PostIncidentReport.assignment_id == assignment_id).first()
+    report = db.query(PostIncidentReport).filter(PostIncidentReport.assignment_id == assignment.id).first()
     
     if not report:
         return {
@@ -536,12 +577,17 @@ async def upload_report_attachments(
 ):
     assignment = db.query(IncidentAssignment).filter(IncidentAssignment.id == assignment_id).first()
     if not assignment:
+        assignment = db.query(IncidentAssignment).filter(
+            IncidentAssignment.incident_id == assignment_id,
+            IncidentAssignment.team_id == current_user.id
+        ).first()
+    if not assignment:
         raise HTTPException(status_code=404, detail="Rescue assignment not found")
         
     if str(assignment.team_id) != str(current_user.id):
         raise HTTPException(status_code=403, detail="Not authorized to upload attachments for this report")
 
-    report = db.query(PostIncidentReport).filter(PostIncidentReport.assignment_id == assignment_id).first()
+    report = db.query(PostIncidentReport).filter(PostIncidentReport.assignment_id == assignment.id).first()
     if not report:
         report = PostIncidentReport(assignment_id=assignment.id, incident_id=assignment.incident_id)
         db.add(report)
@@ -693,6 +739,7 @@ def get_rescue_home_feed(
         data.append({
             "id": incident.id,
             "assignment_id": a.id,
+            "assignmentId": str(a.id),
             "user_id": str(incident.reports[0].user_id) if incident.reports and incident.reports[0].user_id else "",
             "submissions": [{"user_name": reporter_name}],
             "disaster_type": incident.disaster_type,
@@ -855,13 +902,16 @@ def post_live_update(
     db.refresh(live_update)
     
     # Trigger notifications using existing task
-    send_push_notification_task(
-        db,
-        title="Live Rescue Update",
-        body=f"[{payload.category}] {payload.message}",
-        data={"incident_id": str(incident_id), "type": "LIVE_UPDATE"},
-        notification_type=NotificationType.DISASTER_UPDATE
-    )
+    reports = db.query(Report).filter(Report.incident_id == incident_id).all()
+    user_ids = list(set(str(r.user_id) for r in reports if r.user_id))
+    if user_ids:
+        send_push_notification_task(
+            user_ids=user_ids,
+            notification_type=NotificationType.DISASTER_UPDATE,
+            title="Live Rescue Update",
+            body=f"[{payload.category}] {payload.message}",
+            data={"incident_id": str(incident_id), "type": "LIVE_UPDATE"}
+        )
     
     return {
         "success": True,
