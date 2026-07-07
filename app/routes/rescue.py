@@ -601,12 +601,15 @@ async def upload_report_attachments(
     uploaded_records = []
 
     for file in files:
-        if file.content_type != "application/pdf" and not file.filename.lower().endswith('.pdf'):
-            raise HTTPException(status_code=400, detail=f"File {file.filename} is not a PDF")
+        filename = file.filename if file.filename else f"uploaded_{uuid.uuid4().hex[:8]}.pdf"
+        content_type = file.content_type or "application/octet-stream"
+        
+        if content_type != "application/pdf" and not filename.lower().endswith('.pdf'):
+            raise HTTPException(status_code=400, detail=f"File {filename} is not a PDF")
             
         file_bytes = await file.read()
         if len(file_bytes) > MAX_FILE_SIZE:
-            raise HTTPException(status_code=400, detail=f"File {file.filename} exceeds 20MB limit")
+            raise HTTPException(status_code=400, detail=f"File {filename} exceeds 20MB limit")
         
         stored_filename = f"{uuid.uuid4()}.pdf"
         storage_path = f"reports/{report.id}/{stored_filename}"
@@ -623,7 +626,7 @@ async def upload_report_attachments(
             # DB Insertion
             attachment = PostIncidentReportAttachment(
                 post_incident_report_id=report.id,
-                original_filename=file.filename,
+                original_filename=filename,
                 stored_filename=stored_filename,
                 file_url=public_url,
                 file_size=len(file_bytes),
@@ -645,7 +648,7 @@ async def upload_report_attachments(
             traceback.print_exc()
             # If upload fails, continue with other files or rollback? The user asked for "No orphan files remain after failures."
             # We rollback DB if storage fails automatically by not committing.
-            raise HTTPException(status_code=500, detail=f"Failed to upload {file.filename}: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to upload {filename}: {str(e)}")
 
     return {
         "success": True,
